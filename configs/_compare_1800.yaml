@@ -1,0 +1,8 @@
+# Temp: 1800-step (30 sim-min) comparison, video at 10x speed (subframes=3 -> 180s/3min).
+max_time: 1800
+num_agents: 30
+distributed_starts: true
+use_ai_congestion_cost: false
+save_animation: true
+animation_subframes: 3
+online_plan_horizon: 400
