@@ -1,0 +1,32 @@
+name: macpf
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - typer
+  - loguru
+  - tqdm
+  - ruff
+  # --- MAPF engine + congestion dataset/plots ---
+  # numpy must stay < 2.4: numpy 2.4 makes matplotlib savefig hard-crash on Windows
+  # ("fatal exception 0xc06d007f", infinite recursion in transforms.get_affine),
+  # which breaks every plot/animation. torch 2.11+cu128 works fine with numpy 2.3.
+  - numpy<2.4
+  # Force the OpenBLAS variant of numpy. The conda-forge MKL build (mkl 2026.x) hard-crashes
+  # on "import numpy" on Windows (fatal exception 0xC06D007F); OpenBLAS imports cleanly.
+  - libblas=*=*openblas
+  - matplotlib
+  - pyyaml
+  - pillow            # matplotlib PillowWriter (GIF fallback when ffmpeg is absent)
+  - ffmpeg            # matplotlib FFMpegWriter for the run animation MP4 (preferred)
+  # --- congestion model (ConvLSTM): GPU(CUDA) build of PyTorch via pip ---
+  # The "+cu128" local-version tag exists ONLY on the cu128 index, so pip is forced
+  # to install the CUDA wheel (a bare "torch" + --extra-index-url often grabs the
+  # CPU wheel from PyPI instead). Needs a recent NVIDIA driver (RTX 30xx+ ok).
+  # CPU-only machine? Replace the two torch lines with a single bare "- torch".
+  - pip:
+    - --extra-index-url https://download.pytorch.org/whl/cu128
+    - torch==2.11.0+cu128
+    - python-dotenv
+    - -e .

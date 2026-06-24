@@ -1,0 +1,10 @@
+# Classical-vs-online comparison: identical conditions, only the planner differs.
+#   classical: python -m macpf.classical_mapf.classical_mapf --config configs/compare.yaml
+#   online:    python -m macpf.online_mapf               --config configs/compare.yaml
+# use_ai_congestion_cost stays false so classical is a pure conventional baseline;
+# online ignores it and queries the ConvLSTM live every step.
+max_time: 300
+num_agents: 30
+distributed_starts: true
+use_ai_congestion_cost: false
+save_animation: false
