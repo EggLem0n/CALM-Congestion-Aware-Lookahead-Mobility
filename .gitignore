@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Generated artifacts
+data/
+models/
+reports/
+*.npz
+*.zip
+*.mp4
+*.ckpt
+
+# Third-party clone (OpenSTL has its own .git — see README for clone + patch)
+OpenSTL/
+
+# Training artifacts / logs
+work_dirs/
+lightning_logs/
+
+# Claude Code / local assistant config
+.claude/
+CLAUDE.md
+.mcp.json
+
+.venv/
+.env
+.idea/
+.vscode/

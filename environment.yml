@@ -1,0 +1,56 @@
+# ============================================================================
+# OpenSTL training environment  (GPU / CUDA 12.8)  --  VERIFIED WORKING
+# For : C:\Robot\train_openstl_congestion.py   (AMR congestion spatio-temporal prediction)
+#
+# Recreate with:
+#     conda env create -f C:\Robot\environment.yml
+#     conda activate OpenSTL
+#     python C:\Robot\train_openstl_congestion.py
+#
+# Versions below are the exact ones a full end-to-end run (train -> test -> viz)
+# succeeded with on an RTX 3070 (driver 591.86), Windows 11, Python 3.10.8.
+#
+# Why this differs from OpenSTL\environment.yml (each change was REQUIRED to run):
+#   * torch cu128        : original yml resolved to a CPU build, but OpenSTL's
+#                          exp.py hardcodes accelerator='gpu'.
+#   * timm 0.9.16        : code does `from timm.layers import ...`; timm<=0.6.11 lacks it.
+#   * scikit-image 0.25  : 0.19.x crashes against numpy 2.x ("numpy.dtype size changed").
+#   * xarray 2025.6.1    : 0.19.0 crashes against numpy 2.x ("np.unicode_ was removed").
+#   * numpy 2.2.6 kept   : already present and compatible with all of the above.
+#
+# Also note (handled outside this file):
+#   * OpenSTL\openstl\utils\main_utils.py : the gcc/head env probe was wrapped in
+#     try/except (it is absent on Windows).
+#   * train_openstl_congestion.py sets KMP_DUPLICATE_LIB_OK=TRUE (conda OpenMP clash).
+# ============================================================================
+name: OpenSTL
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10.8
+  - pip
+  - pip:
+    # --- PyTorch (CUDA 12.8 GPU build) -----------------------------------
+    - --extra-index-url https://download.pytorch.org/whl/cu128
+    - torch==2.7.1+cu128
+    - torchvision==0.22.1+cu128
+    # --- core / numerics -------------------------------------------------
+    - numpy==2.2.6
+    - lightning==2.2.1
+    # --- OpenSTL runtime deps (exact verified versions) ------------------
+    - timm==0.9.16
+    - scikit-image==0.25.2
+    - scikit-learn==1.7.2
+    - xarray==2025.6.1
+    - fvcore==0.1.5.post20221221
+    - h5py==3.16.0
+    - hickle==5.0.3
+    - opencv-python==4.13.0.92
+    - decord==0.6.0
+    - lpips==0.1.4
+    - einops==0.8.2
+    - pandas==2.3.3
+    - matplotlib==3.10.9
+    - tqdm==4.68.3
+    - pywavelets==1.8.0
+    - packaging==24.2

@@ -1,0 +1,27 @@
+# =====================================================================
+# PIBT-MACPF 시뮬레이션 파라미터 (단일 원본, 필수 파일)
+# ---------------------------------------------------------------------
+# - 모든 파라미터는 여기에만 정의됩니다.
+# - 다른 yaml(--config)은 여기 있는 키만 덮어쓸 수 있고, 없는 키를 쓰면
+#   오타로 간주하고 에러를 냅니다.
+# - generate_heatmap CLI 옵션(--seconds 등)은 yaml보다 우선합니다.
+# =====================================================================
+
+# --- 기본 시뮬레이션 ---
+num_agents: 30                 # AMR 대수 (generate sweep 미사용 시 fallback)
+seed: 42                       # 난수 시드
+distributed_starts: false      # (구) true면 출발점을 맵 전체에 분산. distributed_fraction=1.0과 동일
+distributed_fraction: 0.0      # 0~1: AMR 중 맵 전체로 분산 스폰할 비율(나머지는 충전/스테이징 통로). seed로 결정적
+max_time: 150                  # 시뮬레이션 길이(스텝, 1스텝=1초)
+
+# --- 혼잡 히트맵 라벨 ---
+congestion_center_value: 100.0 # 로봇 위치 칸의 혼잡값
+congestion_step_value: 25.0    # 맨해튼 1칸당 감소량 (0이 될 때까지 자동 확산)
+
+# --- 출발점 선택 ---
+initial_start_clearance_cells: 1  # 출발점 간 최소 이격(칸)
+
+# --- 진행 표시(내부용) ---
+show_planning_progress: false
+planning_progress_label: ""    # 병렬 실행 시 진행 줄 앞 태그
+verbose_planning: false
