@@ -5,10 +5,19 @@ __pycache__/
 build/
 dist/
 
-# Generated artifacts
-data/
-models/
-reports/
+# Keep the folder TREE on GitHub (data/, models/, reports/) via .gitkeep
+# placeholders, but never upload the actual datasets / weights / run outputs.
+/data/**
+!/data/**/
+!/data/**/.gitkeep
+/models/**
+!/models/**/
+!/models/**/.gitkeep
+/reports/**
+!/reports/**/
+!/reports/**/.gitkeep
+
+# Never upload these regardless of folder
 *.npz
 *.zip
 *.mp4
