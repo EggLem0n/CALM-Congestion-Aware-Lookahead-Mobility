@@ -1,0 +1,94 @@
+# =====================================================================
+# MAPF 시뮬레이션 파라미터 전체 목록 (단일 원본, 필수 파일)
+# ---------------------------------------------------------------------
+# - 모든 파라미터는 여기에만 정의됩니다. 파이썬 코드에는 목록이 없습니다.
+# - 다른 yaml(--config로 지정)은 여기 있는 키만 덮어쓸 수 있고,
+#   없는 키를 쓰면 오타로 간주하고 에러를 냅니다.
+# - macpf.generate_heatmap(CLI 옵션 --seconds 등)은 yaml보다 우선합니다.
+# =====================================================================
+
+# --- 기본 시뮬레이션 ---
+num_agents: 30                 # AMR 대수
+seed: 42                       # 난수 시드 (classical_mapf 단독 실행용)
+distributed_starts: false      # true면 출발점을 맵 전체에 분산(한 줄 staging 대신). seed로 결정적
+max_time: 150                  # 시뮬레이션 길이(스텝, 1스텝=1초)
+output_dir: "data/classical_runs"  # classical_mapf 데이터 결과 폴더 (프로젝트 루트 기준 상대경로)
+map_module_name: "macpf.classical_mapf.factory_map_generator"
+verbose_planning: false
+show_planning_progress: false
+planning_progress_label: ""    # 병렬 실행 시 진행 줄 앞에 붙는 태그 (내부용)
+
+# --- 혼잡 히트맵 라벨 ---
+congestion_center_value: 100.0 # 로봇 위치 칸의 혼잡값
+congestion_step_value: 25.0    # 맨해튼 1칸당 감소량 (0이 될 때까지 자동 확산)
+
+# --- AI 혼잡 비용 연동 (ConvLSTM 예측을 경로계획에 반영) ---
+use_ai_congestion_cost: true
+ai_cost_weight: 1.0
+ai_cost_path: "models/congestion_cost.npy"
+
+# --- 온라인 폐루프(receding-horizon) 재계획 (macpf.online_mapf 전용) ---
+# classical_mapf 는 시작 전 1회 계획이지만, online_mapf 는 매 스텝(1초)마다
+# 현재 상태를 ConvLSTM 으로 실시간 예측해 전역 경로를 다시 계획한다.
+online_replan_every: 1          # 몇 스텝(초)마다 예측+전역 재계획할지 (1=매초)
+online_warmup_zero_cost: false  # true면 히스토리가 t_in 미만인 초반엔 AI 비용 0 사용
+online_plan_horizon: 0          # 매 재계획 시 앞으로 몇 스텝까지 계획/예약할지 상한. 0=전체(max_time+lookahead). 긴 시뮬에선 작은 값(예 400)으로 두면 스텝당 비용이 일정해져 훨씬 빠름(목표는 보통 ≤130칸이라 도달성엔 영향 없음)
+
+# --- 솔버 ---
+repeated_task_mode: true       # true면 픽업->납품 반복 임무 모드 (false면 단발성 prioritized)
+continuous_task_lookahead: 100 # max_time 너머로 추가 계획하는 여유 스텝
+
+# --- 기구학(실차 거동) 모델 ---
+use_kinodynamic_motion: true   # macpf.generate_heatmap 은 자동으로 끔
+cell_size_m: 1.0
+dt_s: 1.0
+max_speed_mps: 1.2
+max_accel_mps2: 1.2
+max_decel_mps2: 1.8
+max_angular_speed_radps: 1.8
+min_turn_radius_m: 0.8
+agent_speed_variation: 0.18    # 로봇별 속도 편차 (±18%)
+
+# --- 상황별 속도 배율 ---
+straight_speed_factor: 0.92
+intersection_speed_factor: 0.68
+turn_speed_factor: 0.42
+stop_go_speed_factor: 0.35
+approach_speed_factor: 0.55
+docking_speed_factor: 0.25
+
+# --- 충돌 회피 (경로 계획) ---
+vehicle_size_cells: 1.0
+hard_clearance_cells: 0        # 강제 이격(칸). 0이면 같은 칸 점유만 금지
+initial_start_clearance_cells: 1
+allow_clearance_teleport_repair: false
+soft_proximity_cost_radius_cells: 2  # 소프트 페널티 반경
+soft_proximity_cost_weight: 2.5      # 소프트 페널티 강도
+continuous_safe_gap_cells: 0.99      # 이동 중 보간 위치 최소 간격
+extension_relaxed_safe_gap_cells: 0.70
+
+# --- 반복 임무 + 동적 우선순위 ---
+max_stationary_steps_before_replan: 5  # 이 스텝 이상 갇히면 재계획
+priority_boost_replan_iterations: 4    # 우선순위 부스트 재계획 최대 횟수
+
+# --- 안전 컨트롤러 (기구학 모드) ---
+safety_radius_cells: 3.0
+emergency_stop_radius_cells: 0.55
+safety_min_speed_factor: 0.25
+car_following_radius_cells: 4.5
+car_following_lateral_cells: 0.75
+
+# --- 시각화 / 애니메이션 (classical_mapf 전용) ---
+save_animation: true
+animation_interval_ms: 35
+animation_subframes: 30        # 렌더 전용. 30fps 고정이라 subframes=30이면 리얼타임(시뮬 1초=영상 1초). 낮추면 영상이 빨라지고 렌더는 빨라짐
+use_local_amr_avoidance: true
+local_avoidance_radius_cells: 2.0
+local_avoidance_strength: 0.55
+local_avoidance_max_offset_cells: 0.45
+local_path_update_hz: 1.0
+use_priority_yielding: true
+yield_decision_hold_frames: 8
+use_local_detour_when_blocked: true
+local_detour_max_step_cells: 1.0
+visual_safe_gap_cells: 0.99

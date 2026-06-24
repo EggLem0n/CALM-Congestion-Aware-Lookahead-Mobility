@@ -1,0 +1,17 @@
+# =====================================================================
+# 히트맵 데이터셋 생성 설정 (macpf.generate_heatmap 기본값)
+# ---------------------------------------------------------------------
+# - 여기 적은 키만 configs/default.yaml 기본값을 덮어씁니다. 나머지 모든
+#   파라미터는 configs/default.yaml과 동일한 키 이름으로 추가할 수 있습니다.
+# - macpf.generate_heatmap 에 CLI 옵션(--seconds 등)을 직접 주면 이 파일보다 CLI가
+#   우선합니다.
+# - 에피소드 수(--episodes), 시드(--base-seed), 프로세스 수
+#   (--num_of_process)는 시뮬레이션 설정이 아니라서 CLI 전용입니다.
+# =====================================================================
+
+num_agents: 30                 # AMR 대수
+max_time: 3600                 # 에피소드 길이(초, 1Hz) = --seconds
+
+# 혼잡 히트맵 라벨
+congestion_center_value: 100.0 # 로봇 위치 칸의 혼잡값 = --center-value
+congestion_step_value: 25.0    # 맨해튼 1칸당 감소량 = --step-value
