@@ -48,7 +48,7 @@ import threading
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from itertools import zip_longest
-from multiprocessing import Array, Value
+from multiprocessing import Array, Manager, Value
 from pathlib import Path
 
 import numpy as np
@@ -222,6 +222,16 @@ def _hstack(left_mp4, right_mp4, out_mp4):
 # ---------------------------------------------------------------------------
 _ENV = None
 _BASE_CFG = None
+_RUNNING = None        # pid -> label of the run this worker is doing now (for the live board)
+
+
+def _job_label(job):
+    """Short human label of a run: 'n300 f0.0  peaked md1 g0.61 λ0.5' / '... baseline'."""
+    head = f"n{job['count']:>3} f{job['frac']:.1f}"
+    if job["baseline"]:
+        return f"{head}  baseline"
+    return (f"{head}  {job['depth_mode']:>9} md{job['min_depth']} "
+            f"g{job['gamma']:g} λ{job['weight']:g}")
 
 
 def get_env():
@@ -249,23 +259,29 @@ def _cell_cfg(count, frac, seed, args):
 def run_job(job, args):
     """One planner run. Returns ONLY its CSV row (no path arrays cross the process boundary;
     videos re-run the chosen configs deterministically afterwards)."""
-    env = get_env()
-    walkable = np.asarray(env["walkable_map"]).astype(bool)
-    cfg = _cell_cfg(job["count"], job["frac"], job["seed"], args)
-    starts, _ = mapf.select_start_goal_pairs(env, walkable, cfg)
-    weight = 0.0 if job["baseline"] else job["weight"]
-    _, _, m = solve(weight, env, cfg, starts, args.predict_every,
-                    gamma=job["gamma"], horizon=job["horizon"],
-                    min_depth=job["min_depth"], depth_mode=job["depth_mode"])
-    if job["baseline"]:
-        row = {"episode": job["cell_idx"], "num_agents": job["count"], "frac": job["frac"],
-               "gamma": "", "horizon": job["horizon"], "min_depth": "", "depth_mode": "baseline",
-               "weight": 0.0, "seed": job["seed"], **m}
-    else:
-        row = {"episode": job["cell_idx"], "num_agents": job["count"], "frac": job["frac"],
-               "gamma": job["gamma"], "horizon": job["horizon"], "min_depth": job["min_depth"],
-               "depth_mode": job["depth_mode"], "weight": job["weight"], "seed": job["seed"], **m}
-    return {"cell_idx": job["cell_idx"], "row": row}
+    if _RUNNING is not None:
+        _RUNNING[os.getpid()] = _job_label(job)        # tell the board what this worker is on now
+    try:
+        env = get_env()
+        walkable = np.asarray(env["walkable_map"]).astype(bool)
+        cfg = _cell_cfg(job["count"], job["frac"], job["seed"], args)
+        starts, _ = mapf.select_start_goal_pairs(env, walkable, cfg)
+        weight = 0.0 if job["baseline"] else job["weight"]
+        _, _, m = solve(weight, env, cfg, starts, args.predict_every,
+                        gamma=job["gamma"], horizon=job["horizon"],
+                        min_depth=job["min_depth"], depth_mode=job["depth_mode"])
+        if job["baseline"]:
+            row = {"episode": job["cell_idx"], "num_agents": job["count"], "frac": job["frac"],
+                   "gamma": "", "horizon": job["horizon"], "min_depth": "", "depth_mode": "baseline",
+                   "weight": 0.0, "seed": job["seed"], **m}
+        else:
+            row = {"episode": job["cell_idx"], "num_agents": job["count"], "frac": job["frac"],
+                   "gamma": job["gamma"], "horizon": job["horizon"], "min_depth": job["min_depth"],
+                   "depth_mode": job["depth_mode"], "weight": job["weight"], "seed": job["seed"], **m}
+        return {"cell_idx": job["cell_idx"], "row": row}
+    finally:
+        if _RUNNING is not None:
+            _RUNNING.pop(os.getpid(), None)
 
 
 def video_job(vjob, args, out_dir_str):
@@ -304,7 +320,9 @@ def video_job(vjob, args, out_dir_str):
     return {"cell_idx": vjob["cell_idx"], "videos": names}
 
 
-def _init_worker():
+def _init_worker(running=None):
+    global _RUNNING
+    _RUNNING = running
     signal.signal(signal.SIGINT, signal.SIG_IGN)   # main process handles Ctrl+C
     warnings.filterwarnings("ignore", message=r".*pkg_resources is deprecated.*")
 
@@ -350,9 +368,10 @@ class GridBoard:
     done / running / pending, redrawn via ANSI cursor moves so you can SEE what's running."""
     MARKS = {0: "·", 1: "▶", 2: "✓"}   # pending ·  running ▶  done ✓
 
-    def __init__(self, counts, fracs, total_units, status, counter):
+    def __init__(self, counts, fracs, total_units, status, counter, running=None):
         self.counts, self.fracs = counts, fracs
         self.status, self.counter = status, counter
+        self.running = running
         self.total_cells = len(counts) * len(fracs)
         self.total_units = max(1, total_units)
         self.started = time.perf_counter()
@@ -382,6 +401,13 @@ class GridBoard:
         lines.append(f" cells {done}/{self.total_cells} done, {run} running  |  "
                      f"steps {units}/{self.total_units} ({frac * 100:4.0f}%)  |  "
                      f"elapsed {elapsed / 60:5.1f}m  eta {eta / 60:5.1f}m")
+        try:
+            active = sorted(self.running.values()) if self.running is not None else []
+        except RuntimeError:                          # dict mutated mid-iteration; skip this frame
+            active = []
+        if active:
+            lines.append(f" running now ({len(active)}):")
+            lines.extend(f"   {lab}" for lab in active)
         return lines
 
     def draw(self):
@@ -389,6 +415,9 @@ class GridBoard:
             lines = self._body()
             out = f"\x1b[{self._lines}A" if self._lines else ""
             out += "".join("\x1b[2K" + ln + "\n" for ln in lines)
+            extra = self._lines - len(lines)
+            if extra > 0:                             # clear leftover lines from a taller frame
+                out += "\x1b[2K\n" * extra + f"\x1b[{extra}A"
             sys.stdout.write(out)
             sys.stdout.flush()
             self._lines = len(lines)
@@ -526,6 +555,16 @@ def main():
     jobs = [j for wave in zip_longest(*per_cell_jobs) for j in wave if j is not None]
     total_runs = len(jobs)
 
+    # shared "currently running" map (pid -> label) so the board shows what every worker is on now.
+    # Manager dict for the pool; a plain dict (exposed as the module global) for workers==1.
+    if workers == 1:
+        running = {}
+        globals()["_RUNNING"] = running
+        mgr = None
+    else:
+        mgr = Manager()
+        running = mgr.dict()
+
     counter = Value("i", 0)
     status = Array("b", total)               # per cell; 0=pending 1=running 2=done
     for i in range(total):
@@ -533,7 +572,7 @@ def main():
 
     # Live grid board (unchanged form): a ✓/▶/· per (count, frac) cell, redrawn ~2x/s by a ticker
     # thread. --verbose falls back to a scrolling per-cell line.
-    board = None if args.verbose else GridBoard(counts, fracs, total_runs, status, counter)
+    board = None if args.verbose else GridBoard(counts, fracs, total_runs, status, counter, running)
     stop_tick = threading.Event()
     if board is not None:
         board.draw()
@@ -572,7 +611,7 @@ def main():
             print("\n[interrupted] stopped; partial metrics.csv is kept.", flush=True)
     else:
         # Explicit pool (not `with`): on Ctrl+C, terminate workers immediately.
-        pool = ProcessPoolExecutor(max_workers=workers, initializer=_init_worker)
+        pool = ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(running,))
         try:
             futs = [pool.submit(run_job, job, args) for job in jobs]
             for fut in as_completed(futs):
