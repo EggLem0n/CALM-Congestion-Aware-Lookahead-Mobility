@@ -26,7 +26,8 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(HERE))
-for p in (HERE, REPO_ROOT):                 # predict.py (here) + calm (repo root)
+PRED_DIR = os.path.join(REPO_ROOT, "calm", "congestion_prediction")   # predict.py lives here
+for p in (HERE, PRED_DIR, REPO_ROOT):       # this dir + predict.py's dir + calm (repo root)
     if p not in sys.path:
         sys.path.insert(0, p)
 

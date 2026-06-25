@@ -59,7 +59,8 @@ except ImportError:
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent
-for p in (str(HERE), str(REPO_ROOT)):
+PRED_DIR = REPO_ROOT / "calm" / "congestion_prediction"      # predict.py lives here (lazy import)
+for p in (str(HERE), str(PRED_DIR), str(REPO_ROOT)):
     if p not in sys.path:
         sys.path.insert(0, p)
 

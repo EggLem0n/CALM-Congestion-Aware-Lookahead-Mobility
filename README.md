@@ -26,11 +26,12 @@ calm/
   congestion_prediction/      # 혼잡 예측 모델 (OpenSTL / SimVP)
     train_openstl_congestion.py   학습
     predict.py                    추론 래퍼 (best.ckpt -> torch.nn.Module)
-    grid_eval.py                  혼잡적용 PIBT vs vanilla 비교 (+ 영상)
-    ab_eval.py                    A/B 평가 (콘솔)
-    make_metrics_table.py         metrics.csv -> 표 PNG
     visualize.py                  학습 결과 시각화
     OpenSTL/                      서드파티 클론 (레포 미포함)
+  evaluation/                 # PIBT 혼잡회피 평가·비교 (예측기를 import)
+    grid_eval.py                  혼잡적용 PIBT vs vanilla 비교 그리드 (+ 영상)
+    ab_eval.py                    A/B 평가 (콘솔)
+    make_metrics_table.py         metrics.csv -> 표 PNG
 ```
 
 ## 셋업 & 실행
@@ -62,8 +63,15 @@ git clone -b OpenSTL-Lightning https://github.com/chengtan9907/OpenSTL.git
 ```bash
 python train_openstl_congestion.py     # 학습 -> work_dirs/
 python predict.py                       # 추론 검증
-python grid_eval.py                     # 혼잡적용 vs vanilla 비교
 python visualize.py                     # 학습 결과 그림
+```
+
+### 3) PIBT 혼잡회피 평가·비교 (`calm/evaluation` — 예측기를 import해서 사용)
+```bash
+cd calm/evaluation
+python grid_eval.py                     # 혼잡적용 vs vanilla 비교 그리드 (+ 영상)
+python ab_eval.py                       # A/B 평가 (콘솔)
+python make_metrics_table.py            # metrics.csv -> 표 PNG
 ```
 
 ## 출력(`reports/`) 분류
