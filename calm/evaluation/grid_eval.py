@@ -73,11 +73,17 @@ from calm.PiBT import factory_map_generator as fmg       # noqa: E402
 _PREDICTOR = None
 
 
-def get_predictor(device):
+def get_predictor():
+    """Per-process SimVP predictor singleton. Inference always runs on the GPU."""
     global _PREDICTOR
     if _PREDICTOR is None:
-        from predict import CongestionPredictor      # local import: keeps torch out of --no-* paths
-        _PREDICTOR = CongestionPredictor(device=device)
+        from predict import CongestionPredictor      # local import: keeps torch out of vanilla paths
+        import torch
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "GPU inference is required but CUDA is not available. Install a CUDA build of torch "
+                "(e.g. pip install torch --index-url https://download.pytorch.org/whl/cu121).")
+        _PREDICTOR = CongestionPredictor(device="cuda")
     return _PREDICTOR
 
 
@@ -142,12 +148,12 @@ def evaluate(paths, summary, walkable, config, wall):
     }
 
 
-def solve(weight, env, config, starts, predict_every, device, *,
+def solve(weight, env, config, starts, predict_every, *,
           gamma=0.73, horizon=10, min_depth=2, depth_mode="peaked"):
     walkable = np.asarray(env["walkable_map"]).astype(bool)
     pickup = [p for p in mapf.normalize_points(env.get("pickup_points")) if mapf.is_walkable(*p, walkable)]
     delivery = [p for p in mapf.normalize_points(env.get("delivery_points")) if mapf.is_walkable(*p, walkable)]
-    predictor = get_predictor(device) if weight > 0 else None
+    predictor = get_predictor() if weight > 0 else None
     t0 = time.perf_counter()
     paths, summary = mapf.plan_pibt_repeated_tasks(
         starts, pickup, delivery, walkable, config,
@@ -248,7 +254,7 @@ def run_job(job, args):
     cfg = _cell_cfg(job["count"], job["frac"], job["seed"], args)
     starts, _ = mapf.select_start_goal_pairs(env, walkable, cfg)
     weight = 0.0 if job["baseline"] else job["weight"]
-    _, _, m = solve(weight, env, cfg, starts, args.predict_every, args.device,
+    _, _, m = solve(weight, env, cfg, starts, args.predict_every,
                     gamma=job["gamma"], horizon=job["horizon"],
                     min_depth=job["min_depth"], depth_mode=job["depth_mode"])
     if job["baseline"]:
@@ -279,14 +285,14 @@ def video_job(vjob, args, out_dir_str):
     clip = lambda paths: [p[:vs + 1] for p in paths]
 
     base_paths, base_summary, _ = solve(
-        0.0, env, cfg, starts, args.predict_every, args.device,
+        0.0, env, cfg, starts, args.predict_every,
         gamma=next(iter(best_by_gamma)), horizon=horizon, min_depth=prim_md, depth_mode=prim_mode)
     vanilla_mp4 = _animate_scenario(env, starts, clip(base_paths), base_summary,
                                     anim_cfg, tmp / "vanilla.mp4", tmp / "v")
     names = []
     for g in sorted(best_by_gamma):
         w = best_by_gamma[g]
-        cpaths, csumm, _ = solve(w, env, cfg, starts, args.predict_every, args.device,
+        cpaths, csumm, _ = solve(w, env, cfg, starts, args.predict_every,
                                  gamma=g, horizon=horizon, min_depth=prim_md, depth_mode=prim_mode)
         cong_mp4 = _animate_scenario(env, starts, clip(cpaths), csumm, anim_cfg,
                                      tmp / f"g{g:g}.mp4", tmp / f"c{g:g}")
@@ -446,7 +452,6 @@ def parse_args():
                          "(off by default: 300-750 such polylines clutter the frame).")
     ap.add_argument("--verbose", action="store_true",
                     help="scrolling per-cell/per-video log instead of the tqdm progress bar")
-    ap.add_argument("--device", default=None, help="cuda / cpu (default: auto)")
     args = ap.parse_args()
     if args.min_agents < 1 or args.min_agents > args.max_agents:
         ap.error("require 1 <= --min-agents <= --max-agents")

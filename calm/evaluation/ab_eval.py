@@ -82,7 +82,6 @@ def main() -> None:
     ap.add_argument("--weights", type=float, nargs="+", default=[0.0, 1.0, 3.0],
                     help="congestion_weight values; 0 = plain-PIBT baseline")
     ap.add_argument("--predict-every", type=int, default=10)
-    ap.add_argument("--device", default=None)
     args = ap.parse_args()
 
     env = fmg.build_factory_map()
@@ -93,7 +92,11 @@ def main() -> None:
 
     predictor = None
     if any(w > 0 for w in args.weights):
-        predictor = CongestionPredictor(device=args.device)
+        import torch
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "GPU inference is required but CUDA is not available. Install a CUDA build of torch.")
+        predictor = CongestionPredictor(device="cuda")   # inference always runs on the GPU
         print(f"predictor: best.ckpt on {predictor.device} | y_scale={predictor.y_scale:g}")
 
     print(f"scenario: {args.agents} AMRs | {args.seconds} s | seed {args.seed} | "
