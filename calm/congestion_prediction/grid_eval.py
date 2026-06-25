@@ -157,7 +157,8 @@ def evaluate(paths, summary, walkable, config, wall):
     }
 
 
-def solve(weight, env, config, starts, predict_every, device):
+def solve(weight, env, config, starts, predict_every, device, *,
+          gamma=0.73, horizon=10, min_depth=2, depth_mode="peaked"):
     walkable = np.asarray(env["walkable_map"]).astype(bool)
     pickup = [p for p in mapf.normalize_points(env.get("pickup_points")) if mapf.is_walkable(*p, walkable)]
     delivery = [p for p in mapf.normalize_points(env.get("delivery_points")) if mapf.is_walkable(*p, walkable)]
@@ -167,7 +168,10 @@ def solve(weight, env, config, starts, predict_every, device):
         starts, pickup, delivery, walkable, config,
         pickup_point_groups=mapf.normalize_point_groups(env.get("pickup_point_groups")),
         delivery_point_groups=mapf.normalize_point_groups(env.get("delivery_point_groups")),
-        congestion_predictor=predictor, congestion_weight=weight, predict_every=predict_every,
+        congestion_predictor=predictor, congestion_weight=weight,
+        congestion_gamma=gamma, congestion_horizon=horizon,
+        congestion_min_depth=min_depth, congestion_depth_mode=depth_mode,
+        predict_every=predict_every,
     )
     return paths, summary, evaluate(paths, summary, walkable, config, time.perf_counter() - t0)
 
@@ -237,45 +241,67 @@ def generate_episode(env, episode_id, args, out_dir_str):
                             congestion_step_value=args.step_value, show_planning_progress=False)
     starts, _ = mapf.select_start_goal_pairs(env, walkable, cell_cfg)
 
-    run_weights = sorted(set(args.weights) | ({0.0} if not args.no_video else set()))
+    weights_pos = sorted({w for w in args.weights if w > 0})
+    horizon = args.horizon
     if args.verbose:
-        print(f"  > ep{episode_id:03d} start  {count} AMRs frac {frac:.1f}: {len(run_weights)} runs",
-              flush=True)
+        n_runs = 1 + len(args.depth_modes) * len(args.min_depths) * len(args.gammas) * len(weights_pos)
+        print(f"  > ep{episode_id:03d} start  {count} AMRs frac {frac:.1f}: {n_runs} runs", flush=True)
 
     rows = []
-    solved = {}      # w -> (paths, summary)
-    for w in run_weights:
-        paths, summary, m = solve(w, env, cell_cfg, starts, args.predict_every, args.device)
-        solved[w] = (paths, summary)
-        _bump()                                   # one solve done
-        if w in args.weights:
-            rows.append({"episode": episode_id, "num_agents": count, "frac": frac,
-                         "weight": w, "seed": seed, **m})
+    # baseline (lambda = 0): plain PIBT, identical for every gamma/min_depth/depth_mode, so run once.
+    base_paths, base_summary, base_m = solve(
+        0.0, env, cell_cfg, starts, args.predict_every, args.device,
+        gamma=args.gammas[0], horizon=horizon, min_depth=args.min_depths[0],
+        depth_mode=args.depth_modes[0])
+    rows.append({"episode": episode_id, "num_agents": count, "frac": frac, "gamma": "",
+                 "horizon": horizon, "min_depth": "", "depth_mode": "baseline",
+                 "weight": 0.0, "seed": seed, **base_m})
+    _bump()
 
-    # one 2-panel MP4 per lambda>0: vanilla (left) | that lambda (right), each panel rendered
-    # by MACPF's animate_paths. Vanilla is rendered once per cell and reused for all lambdas.
+    # primary config used for videos (first depth_mode + first min_depth); ablation runs
+    # (other modes / min_depths) go to the CSV only, so the video count stays bounded.
+    prim_mode, prim_md = args.depth_modes[0], args.min_depths[0]
+    best_video = {}      # gamma -> (weight, paths, summary)  for the primary config
+
+    for mode in args.depth_modes:
+        for md in args.min_depths:
+            for g in args.gammas:
+                best = None
+                for w in weights_pos:
+                    paths, summary, m = solve(
+                        w, env, cell_cfg, starts, args.predict_every, args.device,
+                        gamma=g, horizon=horizon, min_depth=md, depth_mode=mode)
+                    rows.append({"episode": episode_id, "num_agents": count, "frac": frac,
+                                 "gamma": g, "horizon": horizon, "min_depth": md,
+                                 "depth_mode": mode, "weight": w, "seed": seed, **m})
+                    _bump()                       # one solve done
+                    if best is None or m["deliveries"] > best[2]:
+                        best = (w, (paths, summary), m["deliveries"])
+                if (not args.no_video and weights_pos and best is not None
+                        and mode == prim_mode and md == prim_md):
+                    best_video[g] = (best[0], best[1][0], best[1][1])
+
+    # videos: vanilla rendered once, then one 2-panel (vanilla | best-lambda) MP4 per gamma.
     videos = []
-    if not args.no_video and 0.0 in solved:
+    if not args.no_video and best_video:
         vdir = Path(out_dir_str) / "videos"
         tmp = vdir / f".tmp_ep{episode_id:03d}"
         anim_cfg = _anim_config(base, args)
-        # videos only show the first --video-seconds steps (full-length 1800-step videos would
-        # take minutes each); metrics above already used the full episode.
+        # videos only show the first --video-seconds steps; metrics above used the full episode.
         vs = args.video_seconds if 0 < args.video_seconds < args.seconds else (args.seconds + 1)
         clip = lambda paths: [p[:vs + 1] for p in paths]
-        vpaths, vsumm = solved[0.0]
-        vanilla_mp4 = _animate_scenario(env, starts, clip(vpaths), vsumm, anim_cfg, tmp / "vanilla.mp4", tmp / "v")
+        vanilla_mp4 = _animate_scenario(env, starts, clip(base_paths), base_summary,
+                                        anim_cfg, tmp / "vanilla.mp4", tmp / "v")
         _bump()                                   # vanilla panel rendered
-        for w in sorted(solved):
-            if w <= 0.0:
-                continue
+        for g in sorted(best_video):
+            w, cpaths, csumm = best_video[g]
             if args.verbose:
-                print(f"  > ep{episode_id:03d} render lambda={w:g}", flush=True)
-            cpaths, csumm = solved[w]
-            lam_mp4 = _animate_scenario(env, starts, clip(cpaths), csumm, anim_cfg, tmp / f"w{w:g}.mp4", tmp / f"c{w:g}")
-            _bump()                               # lambda panel rendered
-            name = f"ep{episode_id:03d}_n{count}_f{frac:.1f}_w{w:g}.mp4"
-            _hstack(vanilla_mp4, lam_mp4, vdir / name)
+                print(f"  > ep{episode_id:03d} render gamma={g:g} best-lambda={w:g}", flush=True)
+            cong_mp4 = _animate_scenario(env, starts, clip(cpaths), csumm, anim_cfg,
+                                         tmp / f"g{g:g}.mp4", tmp / f"c{g:g}")
+            _bump()                               # congestion panel rendered
+            name = f"ep{episode_id:03d}_n{count}_f{frac:.1f}_{prim_mode}_md{prim_md}_g{g:g}_w{w:g}.mp4"
+            _hstack(vanilla_mp4, cong_mp4, vdir / name)
             _bump()                               # 2-panel hstacked
             videos.append(name)
         shutil.rmtree(tmp, ignore_errors=True)
@@ -382,8 +408,9 @@ class GridBoard:
 def parse_args():
     base = mapf.load_config()
     ap = argparse.ArgumentParser(
-        description="3-D grid (AMR count x dispersion frac x congestion weight) A/B eval "
-                    "of congestion-aware PIBT, with a per-cell vanilla-vs-congestion MP4.")
+        description="Grid A/B eval of congestion-aware PIBT over AMR count x dispersion frac x "
+                    "congestion weight (lambda) x depth gamma (+ optional min_depth / depth_mode "
+                    "ablations), with a per-(cell, gamma) vanilla-vs-best-lambda MP4.")
     ap.add_argument("--num_of_process", type=int, default=1,
                     help="Parallel cell jobs. NOTE: lambda>0 runs use the GPU; many processes "
                          "share one GPU (each loads the 220MB model). Raise only if VRAM allows.")
@@ -394,7 +421,15 @@ def parse_args():
                     help="render only the first N steps in the MP4s (0 or >= --seconds = full). "
                          "Default 900 = full when --seconds is also 900.")
     ap.add_argument("--weights", type=float, nargs="+", default=[0.0, 0.25, 0.5, 0.75, 1.0],
-                    help="congestion-weight axis (3rd grid dim); 0 = vanilla PIBT.")
+                    help="congestion-weight (lambda) axis; 0 = vanilla PIBT (computed once per cell).")
+    ap.add_argument("--gammas", type=float, nargs="+", default=[0.73],
+                    help="depth-weight peak r axis (handoff usable band [0.607, 0.730]); "
+                         "default [0.73] = single value (old behaviour). e.g. 0.61 0.66 0.70 0.73")
+    ap.add_argument("--horizon", type=int, default=10, help="H: max descent depth read (<=10).")
+    ap.add_argument("--min-depths", type=int, nargs="+", default=[2],
+                    help="k_start ablation axis (handoff 7-1: '1 2' to compare include/exclude k=1).")
+    ap.add_argument("--depth-modes", nargs="+", default=["peaked"], choices=["peaked", "frontload"],
+                    help="depth-weight shape ablation axis (handoff 7-2: 'peaked frontload').")
     ap.add_argument("--min-agents", type=int, default=300)
     ap.add_argument("--max-agents", type=int, default=500)
     ap.add_argument("--agent-step", type=int, default=100)
@@ -403,7 +438,10 @@ def parse_args():
     ap.add_argument("--frac-step", type=float, default=0.5)
     ap.add_argument("--center-value", type=float, default=base.congestion_center_value)
     ap.add_argument("--step-value", type=float, default=base.congestion_step_value)
-    ap.add_argument("--predict-every", type=int, default=10)
+    ap.add_argument("--predict-every", type=int, default=None,
+                    help="MPC re-predict period; default = 11 - horizon (keeps full-depth lookahead, "
+                         "handoff section 4). Raising it is cheaper but the penalty fades late in "
+                         "each window.")
     ap.add_argument("--no-video", action="store_true", help="metrics only, skip MP4s")
     # --- MACPF animate_paths knobs (videos) ---
     ap.add_argument("--anim-subframes", type=int, default=1,
@@ -433,20 +471,29 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.horizon = max(1, min(10, int(args.horizon)))
+    if args.predict_every is None:
+        args.predict_every = max(1, 11 - args.horizon)   # full-depth lookahead (handoff section 4)
     counts, fracs = agent_count_sweep(args), frac_sweep(args)
     grid = grid_cells(args)
     weights = sorted(args.weights)
+    weights_pos = [w for w in weights if w > 0]
+    gammas, min_depths, depth_modes = args.gammas, args.min_depths, args.depth_modes
 
     # group comparison runs under reports/CALM_comparison/<yymmdd_hhmm>/ (attributable to this code)
     out_dir = REPO_ROOT / "reports" / "CALM_comparison" / datetime.now().strftime("%y%m%d_%H%M")
     (out_dir / "videos").mkdir(parents=True, exist_ok=True)
     env = fmg.build_factory_map()
 
-    n_pos = len([w for w in weights if w > 0])
-    n_vid = 0 if args.no_video else len(grid) * n_pos
-    print(f"3-D grid: counts {counts} x fracs {fracs} x weights {weights}  "
-          f"= {len(grid)} cells x {len(weights)} = {len(grid) * len(weights)} runs"
-          f"{'' if args.no_video else f'  (+{n_vid} MP4s: vanilla vs each lambda>0)'}", flush=True)
+    # per cell: 1 baseline (lambda=0) + (depth_mode x min_depth x gamma x lambda>0) congestion runs
+    cong_per_cell = len(depth_modes) * len(min_depths) * len(gammas) * len(weights_pos)
+    runs_per_cell = 1 + cong_per_cell
+    n_vid = 0 if (args.no_video or not weights_pos) else len(grid) * len(gammas)
+    print(f"grid: counts {counts} x fracs {fracs} | lambdas {weights} x gammas {gammas} "
+          f"| min_depths {min_depths} x depth_modes {depth_modes}")
+    print(f"  = {len(grid)} cells x {runs_per_cell} runs = {len(grid) * runs_per_cell} planner runs "
+          f"| horizon {args.horizon} | predict_every {args.predict_every}"
+          f"{'' if args.no_video else f'  (+{n_vid} MP4s: vanilla vs best-lambda per gamma)'}", flush=True)
     print(f"output -> {out_dir}\n", flush=True)
 
     all_rows, episode_videos = [], {}
@@ -457,9 +504,10 @@ def main():
     # long 550-run sweep that gets interrupted still keeps every completed cell's metrics
     # (and the per-cell MP4s are likewise already on disk).
     csv_path = out_dir / "metrics.csv"
-    csv_fields = ["episode", "num_agents", "frac", "weight", "seed", "deliveries", "energy",
-                  "energy_per_delivery", "density_uniformity", "occ_cv", "mean_robot_cong",
-                  "p99_cong", "peak_cong", "collisions", "preds", "wall_s"]
+    csv_fields = ["episode", "num_agents", "frac", "gamma", "horizon", "min_depth", "depth_mode",
+                  "weight", "seed", "deliveries", "energy", "energy_per_delivery",
+                  "density_uniformity", "occ_cv", "mean_robot_cong", "p99_cong", "peak_cong",
+                  "collisions", "preds", "wall_s"]
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
         csv.DictWriter(fh, fieldnames=csv_fields).writeheader()
 
@@ -468,9 +516,9 @@ def main():
     # Progress = a shared sub-step counter (each solve / render / hstack) + a shared per-cell
     # status array (0 pending, 1 running, 2 done) that workers update, so the main process can
     # draw the WHOLE grid as a live board instead of a single opaque bar.
-    run_weights_main = sorted(set(weights) | ({0.0} if not args.no_video else set()))
-    n_pos = len([w for w in weights if w > 0])
-    per_cell_units = len(run_weights_main) + (0 if args.no_video else (1 + n_pos) + n_pos)
+    # per cell: runs_per_cell solves + (vanilla + render+hstack per gamma) video units
+    video_units = 0 if (args.no_video or not weights_pos) else (1 + 2 * len(gammas))
+    per_cell_units = runs_per_cell + video_units
     total_units = total * per_cell_units
     counter = Value("i", 0)
     status = Array("b", total)               # per episode_id; 0=pending 1=running 2=done
@@ -540,11 +588,12 @@ def main():
     (out_dir / "metadata.json").write_text(json.dumps({
         "tool": "grid_eval", "solver": "pibt_lifelong",
         "counts": counts, "fracs": fracs, "weights": weights,
+        "gammas": gammas, "min_depths": min_depths, "depth_modes": depth_modes,
+        "horizon": args.horizon, "predict_every": args.predict_every,
         "seconds": args.seconds, "base_seed": args.base_seed,
-        "predict_every": args.predict_every,
         "congestion_center_value": args.center_value, "congestion_step_value": args.step_value,
         "cells": total, "cells_completed": len(episode_videos), "interrupted": interrupted,
-        "runs": total * len(weights),
+        "runs": total * runs_per_cell,
         "elapsed_min": (time.perf_counter() - t0) / 60.0,
         "episode_videos": episode_videos,
     }, indent=2), encoding="utf-8")
@@ -564,6 +613,24 @@ def main():
                   f"{mean('energy_per_delivery'):>7.2f} {mean('density_uniformity'):>6.3f} "
                   f"{mean('occ_cv'):>5.2f} {mean('mean_robot_cong'):>6.1f} {mean('p99_cong'):>6.0f} "
                   f"{int(sum(r['collisions'] for r in sub)):>4}")
+
+    # ---- best lambda per (depth_mode, min_depth, gamma): section-5 fair comparison ----
+    cong_rows = [r for r in all_rows if r["depth_mode"] != "baseline"]
+    if cong_rows:
+        base_rows = [r for r in all_rows if r["depth_mode"] == "baseline"]
+        base_mean = float(np.mean([r["deliveries"] for r in base_rows])) if base_rows else float("nan")
+        print(f"\n=== best lambda per gamma (mean deliveries over cells; baseline {base_mean:.1f}) ===")
+        hdr = f"{'mode':>9} {'md':>3} {'gamma':>6} | {'best lam':>8} {'deliv':>6} {'d-base':>7}"
+        print(hdr); print("-" * len(hdr))
+        for combo in sorted({(r["depth_mode"], r["min_depth"], r["gamma"]) for r in cong_rows}):
+            mode, md, g = combo
+            by_w = {}
+            for r in cong_rows:
+                if (r["depth_mode"], r["min_depth"], r["gamma"]) == combo:
+                    by_w.setdefault(r["weight"], []).append(r["deliveries"])
+            best_w = max(by_w, key=lambda w: float(np.mean(by_w[w])))
+            best_d = float(np.mean(by_w[best_w]))
+            print(f"{mode:>9} {md:>3} {g:>6g} | {best_w:>8g} {best_d:>6.1f} {best_d - base_mean:>+7.1f}")
 
     # save the by-lambda table as an image too (out_dir; rides along when moved below)
     if all_rows:
