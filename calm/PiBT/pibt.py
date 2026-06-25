@@ -239,8 +239,13 @@ def plan_pibt_repeated_tasks(
             else:
                 def key_fn(c: Coord):
                     base = float(field[c[1], c[0]])
-                    # staying put (c == pos) has no downstream path to penalize
-                    cong = 0.0 if c == pos[ai] else congestion_cost(c, g, pred, offset)
+                    # Score EVERY candidate -- including staying put -- by the congestion
+                    # on its own descent path to the goal, on equal footing. (Zeroing the
+                    # stay candidate made motion always cost the full forward-path toll
+                    # while staying cost nothing, so the agent froze whenever any jam lay
+                    # ahead; the penalty must only discriminate AMONG options, never
+                    # penalize forward progress itself.)
+                    cong = congestion_cost(c, g, pred, offset)
                     return (base + congestion_weight * cong, rng.random())
                 cands.sort(key=key_fn)
             for v in cands:
