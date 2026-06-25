@@ -39,6 +39,49 @@ def set_planning_progress_hook(hook: Optional[Callable[[], None]]) -> None:
     PLANNING_PROGRESS_HOOK = hook
 
 
+def _depth_weight(k: int, gamma: float) -> float:
+    """Peaked depth weight ``w_k = k * gamma**(k-1)`` (rises then falls); the default.
+
+    The peak sits a few cells ahead of the agent (where a detour is still possible),
+    rather than on the immediate cell (k=1), which a step can never avoid anyway."""
+    return float(k) * gamma ** (k - 1)
+
+
+def _depth_weight_frontload(k: int, gamma: float) -> float:
+    """Front-loaded depth weight ``w_k = gamma**(k-1)`` -- the ablation alternative that
+    puts the most weight on the nearest cells instead of a few cells ahead."""
+    return gamma ** (k - 1)
+
+
+def _steepest_descent_path(
+    start: Coord, field: np.ndarray, walkable: np.ndarray, horizon: int
+) -> List[Tuple[int, Coord]]:
+    """Path that follows the BFS distance ``field`` downhill from ``start`` to its goal.
+
+    Returns ``[(k, cell), ...]`` for k = 1..horizon (k=1 is ``start`` itself); each step
+    strictly decreases the distance by 1. Ties break by ``walkable_neighbors`` order
+    (R,L,D,U), so the path is deterministic. Stops on reaching the goal (no strictly
+    closer neighbour) or at ``horizon``. ``field`` is static (walls are ``inf`` and never
+    read, since candidates come from ``walkable_neighbors``), so the path is static too
+    and can be cached per (start, goal)."""
+    sx, sy = start
+    if not np.isfinite(field[sy, sx]):
+        return [(1, start)]
+    cells: List[Tuple[int, Coord]] = [(1, start)]
+    cur, cur_d = start, float(field[sy, sx])
+    for k in range(2, horizon + 1):
+        best, best_d = None, cur_d
+        for nb in walkable_neighbors(cur, walkable):
+            d = float(field[nb[1], nb[0]])
+            if d < best_d:                     # strictly closer neighbour (exists until the goal)
+                best, best_d = nb, d
+        if best is None:
+            break
+        cells.append((k, best))
+        cur, cur_d = best, best_d
+    return cells
+
+
 def plan_pibt_repeated_tasks(
     starts: Sequence[Coord],
     pickup_points: Sequence[Coord],
@@ -48,19 +91,27 @@ def plan_pibt_repeated_tasks(
     pickup_point_groups: Optional[Dict[str, List[Coord]]] = None,
     delivery_point_groups: Optional[Dict[str, List[Coord]]] = None,
     congestion_predictor: Any = None,
-    congestion_weight: float = 0.0,
+    congestion_weight: float = 0.0,         # lambda: strength of the congestion penalty
+    congestion_gamma: float = 0.73,         # r: controls the depth weight's peak position
+    congestion_horizon: int = 10,           # H: max descent depth read (<= 10 forecast frames)
+    congestion_min_depth: int = 2,          # k_start: skip k=1 (the candidate cell itself)
+    congestion_depth_mode: str = "peaked",  # "peaked" (k*r^(k-1)) or "frontload" (r^(k-1))
     predict_every: int = 10,
 ) -> Tuple[List[PathType], Dict[str, Any]]:
     """Lifelong PIBT. With ``congestion_predictor`` set and ``congestion_weight > 0``
     it becomes congestion-aware: every step the live congestion frame (same additive
     tent as the dataset label) is pushed into a 10-frame buffer; once full, the
     predictor forecasts the next 10 frames (re-run every ``predict_every`` steps,
-    MPC-style) and each agent's move cost gains ``congestion_weight * predicted /
-    center_value`` -- a soft penalty in distance-cell units that steers agents off
-    soon-to-be-congested cells. The predictor is duck-typed (``.predict((10,1,H,W))
-    -> (10,1,H,W)`` raw congestion) so this numpy-only module never imports torch.
-    With no predictor / weight 0 the behaviour is byte-for-byte the original PIBT,
-    which is exactly the A/B baseline."""
+    MPC-style). Each candidate move is then ranked not by a single predicted cell but by
+    the predicted congestion ACCUMULATED along the steepest-descent path from that
+    candidate toward the goal -- arrival-time aligned (depth k reads forecast frame
+    ``offset + (k-1)``) and depth-weighted by ``w_k`` (peaked ``k * gamma**(k-1)`` by
+    default), summed raw and scaled by ``congestion_weight / center_value``. Accumulating
+    (rather than reading one cell) is what makes a genuine detour cheaper than ploughing
+    through a forecast jam. The predictor is duck-typed (``.predict((10,1,H,W)) ->
+    (10,1,H,W)`` raw congestion) so this numpy-only module never imports torch. With no
+    predictor / weight 0 the behaviour is byte-for-byte the original PIBT, which is
+    exactly the A/B baseline."""
     rng = np.random.default_rng(config.seed + 1000)
     walkable = np.asarray(walkable_map).astype(bool)
     H, W = walkable.shape[:2]
@@ -73,6 +124,11 @@ def plan_pibt_repeated_tasks(
     center_v = float(config.congestion_center_value)
     step_v = float(config.congestion_step_value)
     predict_every = max(1, min(10, int(predict_every)))
+    congestion_horizon = max(1, min(10, int(congestion_horizon)))
+    congestion_min_depth = max(1, int(congestion_min_depth))
+    weight_fn = (_depth_weight_frontload
+                 if str(congestion_depth_mode) == "frontload" else _depth_weight)
+    path_cache: Dict[Tuple[Coord, Coord], List[Tuple[int, Coord]]] = {}
     cong_buffer: deque = deque(maxlen=10)        # last 10 live congestion frames (raw)
     pred_future: Optional[np.ndarray] = None     # (10, H, W) raw predicted congestion
     pred_base_t = -1                             # time index of the latest frame fed to the model
@@ -137,24 +193,56 @@ def plan_pibt_repeated_tasks(
     for i in range(N):  # first target (pickup) at t=0
         assign(i, True, 0)
 
+    # --- congestion penalty: cumulative, depth-weighted, along the descent path ---
+    def descent_path(start: Coord, goal_cell: Coord) -> List[Tuple[int, Coord]]:
+        key = (start, goal_cell)
+        p = path_cache.get(key)
+        if p is None:
+            p = _steepest_descent_path(
+                start, cache.field(goal_cell), walkable, congestion_horizon)
+            path_cache[key] = p
+        return p
+
+    def congestion_cost(start: Coord, goal_cell: Coord,
+                        pred: np.ndarray, offset: int) -> float:
+        """Sum_{k=k_start}^{H} w_k * pred[offset+k-1][cell_k], divided by center_v, along
+        the steepest-descent path from ``start`` toward ``goal_cell``. The sum is RAW (not
+        averaged) so more jam on the path means a strictly larger penalty; it stops
+        naturally at the goal or once the arrival frame leaves the 10-frame forecast."""
+        if start == goal_cell:
+            return 0.0
+        total = 0.0
+        for k, cell in descent_path(start, goal_cell):
+            if k < congestion_min_depth:            # default 2 -> skip k=1 (the cell itself)
+                continue
+            frame = offset + (k - 1)                 # arrival-time alignment
+            if frame > 9:                            # past the forecast horizon
+                break
+            total += weight_fn(k, congestion_gamma) * float(pred[frame, cell[1], cell[0]])
+        return total / center_v
+
     # --- one collision-free PIBT timestep ---
-    def pibt_step(pen_field: Optional[np.ndarray]) -> List[Coord]:
+    def pibt_step(pred: Optional[np.ndarray], offset: int) -> List[Coord]:
         next_v: List[Optional[Coord]] = [None] * N
         occupied_next: Dict[Coord, int] = {}
         occupied_now: Dict[Coord, int] = {pos[i]: i for i in range(N)}
 
         def pibt(ai: int, forbidden: Optional[Coord]) -> bool:
-            field = cache.field(goal[ai])
+            g = goal[ai]
+            field = cache.field(g)
             cands = [pos[ai]] + walkable_neighbors(pos[ai], walkable)
             # Ranking by distance-to-goal (+ optional congestion penalty) only changes
             # PREFERENCE; collision-freedom comes from the inheritance/backtracking below
             # and is unaffected, so the penalty can never make a step illegal.
-            if pen_field is None:
+            if pred is None or congestion_weight <= 0.0:
                 cands.sort(key=lambda c: (float(field[c[1], c[0]]), rng.random()))
             else:
-                cands.sort(key=lambda c: (float(field[c[1], c[0]])
-                                          + congestion_weight * float(pen_field[c[1], c[0]]),
-                                          rng.random()))
+                def key_fn(c: Coord):
+                    base = float(field[c[1], c[0]])
+                    # staying put (c == pos) has no downstream path to penalize
+                    cong = 0.0 if c == pos[ai] else congestion_cost(c, g, pred, offset)
+                    return (base + congestion_weight * cong, rng.random())
+                cands.sort(key=key_fn)
             for v in cands:
                 if v in occupied_next:
                     continue
@@ -181,7 +269,8 @@ def plan_pibt_repeated_tasks(
 
     # --- lifelong loop ---
     for t in range(1, T + 1):
-        pen_field: Optional[np.ndarray] = None
+        pred_for_step: Optional[np.ndarray] = None
+        offset = 0
         if use_congestion:
             # live congestion from the current (pre-move) positions == congestion at
             # time t-1; identical additive tent to the dataset label, so the predictor
@@ -192,6 +281,9 @@ def plan_pibt_repeated_tasks(
             if len(cong_buffer) == 10:
                 # pred_future[k] forecasts time (pred_base_t + 1 + k); we are choosing the
                 # move that lands at time t, so we want offset = t - pred_base_t - 1.
+                # congestion_cost reads frame offset+(k-1) along each candidate's descent
+                # path and normalizes by center_value itself, so congestion_weight stays
+                # in distance-cell units (~ extra detour cells per agent-equivalent of jam).
                 offset = t - pred_base_t - 1
                 if pred_future is None or offset >= predict_every:
                     past = np.stack(cong_buffer)[:, None, :, :]    # (10, 1, H, W) raw
@@ -199,10 +291,8 @@ def plan_pibt_repeated_tasks(
                     pred_base_t = t - 1
                     prediction_count += 1
                     offset = 0
-                # normalize by center_value so congestion_weight is in distance-cell units
-                # (~"extra cells of detour per one-agent-equivalent of congestion").
-                pen_field = pred_future[min(offset, 9)] / center_v
-        nxt = pibt_step(pen_field)
+                pred_for_step = pred_future
+        nxt = pibt_step(pred_for_step, offset)
         for i in range(N):
             pos[i] = nxt[i]
             paths[i].append(pos[i])
@@ -246,6 +336,10 @@ def plan_pibt_repeated_tasks(
         "safe_extension_failed_steps": 0,
         "congestion_aware": bool(use_congestion),
         "congestion_weight": float(congestion_weight) if use_congestion else 0.0,
+        "congestion_gamma": float(congestion_gamma),
+        "congestion_horizon": int(congestion_horizon),
+        "congestion_min_depth": int(congestion_min_depth),
+        "congestion_depth_mode": str(congestion_depth_mode),
         "congestion_prediction_count": int(prediction_count),
     }
     return paths, summary
