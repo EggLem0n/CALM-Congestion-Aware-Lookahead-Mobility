@@ -47,6 +47,7 @@ import argparse
 import threading
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
+from itertools import zip_longest
 from multiprocessing import Array, Value
 from pathlib import Path
 
@@ -67,26 +68,9 @@ for p in (str(HERE), str(PRED_DIR), str(REPO_ROOT)):
 from calm import PiBT as mapf                                    # noqa: E402
 from calm.PiBT import factory_map_generator as fmg       # noqa: E402
 
-# Lazily-built, per-process singletons (avoid importing torch / loading the 220MB
-# model in workers that only run vanilla, and avoid re-loading per episode).
+# Lazily-built, per-process singleton (avoid importing torch / loading the 220MB model in
+# workers that only run vanilla baselines, and avoid re-loading it per run).
 _PREDICTOR = None
-# Shared sub-step counter (solves + renders + hstacks) so the progress display advances
-# WITHIN a cell, not just once per finished cell -- workers bump it across processes.
-_PROGRESS = None
-# Shared per-cell status array (0=pending, 1=running, 2=done), indexed by episode_id, so the
-# main process can draw the whole grid with a ✓/▶/· per cell.
-_STATUS = None
-
-
-def _bump():
-    if _PROGRESS is not None:
-        with _PROGRESS.get_lock():
-            _PROGRESS.value += 1
-
-
-def _set_status(episode_id, value):
-    if _STATUS is not None:
-        _STATUS[episode_id] = value
 
 
 def get_predictor(device):
@@ -226,94 +210,95 @@ def _hstack(left_mp4, right_mp4, out_mp4):
 
 
 # ---------------------------------------------------------------------------
-# one episode = one (count, frac) cell, swept over all lambdas
+# work unit = ONE planner run (a single grid point), so every worker stays busy:
+# the total run count vastly outnumbers the workers. env / base config are
+# per-process singletons (built once per worker, reused across that worker's runs).
 # ---------------------------------------------------------------------------
-def generate_episode(env, episode_id, args, out_dir_str):
-    _set_status(episode_id, 1)                  # mark this cell running on the grid board
-    cell = grid_cells(args)[episode_id]
-    count, frac = cell
-    seed = args.base_seed + episode_id          # per-cell seed, SHARED across lambdas (controlled A/B)
-    base = mapf.load_config()
+_ENV = None
+_BASE_CFG = None
+
+
+def get_env():
+    global _ENV
+    if _ENV is None:
+        _ENV = fmg.build_factory_map()
+    return _ENV
+
+
+def get_base_cfg():
+    global _BASE_CFG
+    if _BASE_CFG is None:
+        _BASE_CFG = mapf.load_config()
+    return _BASE_CFG
+
+
+def _cell_cfg(count, frac, seed, args):
+    """Deterministic per-cell config (same seed -> same starts & run, sharable across runs)."""
+    return get_base_cfg().replace(
+        num_agents=count, distributed_fraction=frac, seed=seed, max_time=args.seconds,
+        congestion_center_value=args.center_value, congestion_step_value=args.step_value,
+        show_planning_progress=False)
+
+
+def run_job(job, args):
+    """One planner run. Returns ONLY its CSV row (no path arrays cross the process boundary;
+    videos re-run the chosen configs deterministically afterwards)."""
+    env = get_env()
     walkable = np.asarray(env["walkable_map"]).astype(bool)
-
-    # one fixed start layout per cell (same seed) -> shared by every lambda and the videos
-    cell_cfg = base.replace(num_agents=count, distributed_fraction=frac, seed=seed,
-                            max_time=args.seconds, congestion_center_value=args.center_value,
-                            congestion_step_value=args.step_value, show_planning_progress=False)
-    starts, _ = mapf.select_start_goal_pairs(env, walkable, cell_cfg)
-
-    weights_pos = sorted({w for w in args.weights if w > 0})
-    horizon = args.horizon
-    if args.verbose:
-        n_runs = 1 + len(args.depth_modes) * len(args.min_depths) * len(args.gammas) * len(weights_pos)
-        print(f"  > ep{episode_id:03d} start  {count} AMRs frac {frac:.1f}: {n_runs} runs", flush=True)
-
-    rows = []
-    # baseline (lambda = 0): plain PIBT, identical for every gamma/min_depth/depth_mode, so run once.
-    base_paths, base_summary, base_m = solve(
-        0.0, env, cell_cfg, starts, args.predict_every, args.device,
-        gamma=args.gammas[0], horizon=horizon, min_depth=args.min_depths[0],
-        depth_mode=args.depth_modes[0])
-    rows.append({"episode": episode_id, "num_agents": count, "frac": frac, "gamma": "",
-                 "horizon": horizon, "min_depth": "", "depth_mode": "baseline",
-                 "weight": 0.0, "seed": seed, **base_m})
-    _bump()
-
-    # primary config used for videos (first depth_mode + first min_depth); ablation runs
-    # (other modes / min_depths) go to the CSV only, so the video count stays bounded.
-    prim_mode, prim_md = args.depth_modes[0], args.min_depths[0]
-    best_video = {}      # gamma -> (weight, paths, summary)  for the primary config
-
-    for mode in args.depth_modes:
-        for md in args.min_depths:
-            for g in args.gammas:
-                best = None
-                for w in weights_pos:
-                    paths, summary, m = solve(
-                        w, env, cell_cfg, starts, args.predict_every, args.device,
-                        gamma=g, horizon=horizon, min_depth=md, depth_mode=mode)
-                    rows.append({"episode": episode_id, "num_agents": count, "frac": frac,
-                                 "gamma": g, "horizon": horizon, "min_depth": md,
-                                 "depth_mode": mode, "weight": w, "seed": seed, **m})
-                    _bump()                       # one solve done
-                    if best is None or m["deliveries"] > best[2]:
-                        best = (w, (paths, summary), m["deliveries"])
-                if (not args.no_video and weights_pos and best is not None
-                        and mode == prim_mode and md == prim_md):
-                    best_video[g] = (best[0], best[1][0], best[1][1])
-
-    # videos: vanilla rendered once, then one 2-panel (vanilla | best-lambda) MP4 per gamma.
-    videos = []
-    if not args.no_video and best_video:
-        vdir = Path(out_dir_str) / "videos"
-        tmp = vdir / f".tmp_ep{episode_id:03d}"
-        anim_cfg = _anim_config(base, args)
-        # videos only show the first --video-seconds steps; metrics above used the full episode.
-        vs = args.video_seconds if 0 < args.video_seconds < args.seconds else (args.seconds + 1)
-        clip = lambda paths: [p[:vs + 1] for p in paths]
-        vanilla_mp4 = _animate_scenario(env, starts, clip(base_paths), base_summary,
-                                        anim_cfg, tmp / "vanilla.mp4", tmp / "v")
-        _bump()                                   # vanilla panel rendered
-        for g in sorted(best_video):
-            w, cpaths, csumm = best_video[g]
-            if args.verbose:
-                print(f"  > ep{episode_id:03d} render gamma={g:g} best-lambda={w:g}", flush=True)
-            cong_mp4 = _animate_scenario(env, starts, clip(cpaths), csumm, anim_cfg,
-                                         tmp / f"g{g:g}.mp4", tmp / f"c{g:g}")
-            _bump()                               # congestion panel rendered
-            name = f"ep{episode_id:03d}_n{count}_f{frac:.1f}_{prim_mode}_md{prim_md}_g{g:g}_w{w:g}.mp4"
-            _hstack(vanilla_mp4, cong_mp4, vdir / name)
-            _bump()                               # 2-panel hstacked
-            videos.append(name)
-        shutil.rmtree(tmp, ignore_errors=True)
-    _set_status(episode_id, 2)                  # mark this cell done on the grid board
-    return {"episode": episode_id, "cell": cell, "rows": rows, "videos": videos}
+    cfg = _cell_cfg(job["count"], job["frac"], job["seed"], args)
+    starts, _ = mapf.select_start_goal_pairs(env, walkable, cfg)
+    weight = 0.0 if job["baseline"] else job["weight"]
+    _, _, m = solve(weight, env, cfg, starts, args.predict_every, args.device,
+                    gamma=job["gamma"], horizon=job["horizon"],
+                    min_depth=job["min_depth"], depth_mode=job["depth_mode"])
+    if job["baseline"]:
+        row = {"episode": job["cell_idx"], "num_agents": job["count"], "frac": job["frac"],
+               "gamma": "", "horizon": job["horizon"], "min_depth": "", "depth_mode": "baseline",
+               "weight": 0.0, "seed": job["seed"], **m}
+    else:
+        row = {"episode": job["cell_idx"], "num_agents": job["count"], "frac": job["frac"],
+               "gamma": job["gamma"], "horizon": job["horizon"], "min_depth": job["min_depth"],
+               "depth_mode": job["depth_mode"], "weight": job["weight"], "seed": job["seed"], **m}
+    return {"cell_idx": job["cell_idx"], "row": row}
 
 
-def _init_worker(counter, status):
-    global _PROGRESS, _STATUS
-    _PROGRESS = counter
-    _STATUS = status
+def video_job(vjob, args, out_dir_str):
+    """Render one vanilla|congestion MP4 per gamma for a cell (primary config, best lambda).
+    Re-runs the baseline + each chosen config deterministically, so no paths are shipped."""
+    env = get_env()
+    walkable = np.asarray(env["walkable_map"]).astype(bool)
+    cfg = _cell_cfg(vjob["count"], vjob["frac"], vjob["seed"], args)
+    starts, _ = mapf.select_start_goal_pairs(env, walkable, cfg)
+    prim_mode, prim_md, horizon = vjob["prim_mode"], vjob["prim_md"], vjob["horizon"]
+    best_by_gamma = vjob["best_by_gamma"]
+
+    vdir = Path(out_dir_str) / "videos"
+    tmp = vdir / f".tmp_ep{vjob['cell_idx']:03d}"
+    anim_cfg = _anim_config(cfg, args)
+    vs = args.video_seconds if 0 < args.video_seconds < args.seconds else (args.seconds + 1)
+    clip = lambda paths: [p[:vs + 1] for p in paths]
+
+    base_paths, base_summary, _ = solve(
+        0.0, env, cfg, starts, args.predict_every, args.device,
+        gamma=next(iter(best_by_gamma)), horizon=horizon, min_depth=prim_md, depth_mode=prim_mode)
+    vanilla_mp4 = _animate_scenario(env, starts, clip(base_paths), base_summary,
+                                    anim_cfg, tmp / "vanilla.mp4", tmp / "v")
+    names = []
+    for g in sorted(best_by_gamma):
+        w = best_by_gamma[g]
+        cpaths, csumm, _ = solve(w, env, cfg, starts, args.predict_every, args.device,
+                                 gamma=g, horizon=horizon, min_depth=prim_md, depth_mode=prim_mode)
+        cong_mp4 = _animate_scenario(env, starts, clip(cpaths), csumm, anim_cfg,
+                                     tmp / f"g{g:g}.mp4", tmp / f"c{g:g}")
+        name = (f"ep{vjob['cell_idx']:03d}_n{vjob['count']}_f{vjob['frac']:.1f}_"
+                f"{prim_mode}_md{prim_md}_g{g:g}_w{w:g}.mp4")
+        _hstack(vanilla_mp4, cong_mp4, vdir / name)
+        names.append(name)
+    shutil.rmtree(tmp, ignore_errors=True)
+    return {"cell_idx": vjob["cell_idx"], "videos": names}
+
+
+def _init_worker():
     signal.signal(signal.SIGINT, signal.SIG_IGN)   # main process handles Ctrl+C
     warnings.filterwarnings("ignore", message=r".*pkg_resources is deprecated.*")
 
@@ -514,21 +499,36 @@ def main():
 
     total = len(grid)
 
-    # Progress = a shared sub-step counter (each solve / render / hstack) + a shared per-cell
-    # status array (0 pending, 1 running, 2 done) that workers update, so the main process can
-    # draw the WHOLE grid as a live board instead of a single opaque bar.
-    # per cell: runs_per_cell solves + (vanilla + render+hstack per gamma) video units
-    video_units = 0 if (args.no_video or not weights_pos) else (1 + 2 * len(gammas))
-    per_cell_units = runs_per_cell + video_units
-    total_units = total * per_cell_units
-    counter = Value("i", 0)
-    status = Array("b", total)               # per episode_id; 0=pending 1=running 2=done
-    global _PROGRESS, _STATUS
-    _PROGRESS, _STATUS = counter, status     # used in-process when workers == 1
+    # WORK UNIT = one planner run (not a whole cell): there are runs_per_cell runs per cell,
+    # times every cell, which vastly outnumbers the workers, so no worker ever sits idle until
+    # the very tail. Jobs are interleaved across cells (round-robin) so every cell has work in
+    # the first wave. The board keeps its current form (one mark per (count, frac) cell); a
+    # cell flips to done once all of its own runs complete.
+    per_cell_jobs = []
+    for ci, (count, frac) in enumerate(grid):
+        seed = args.base_seed + ci               # per-cell seed, shared by that cell's runs (A/B)
+        jl = [{"cell_idx": ci, "count": count, "frac": frac, "seed": seed, "baseline": True,
+               "weight": 0.0, "gamma": gammas[0], "horizon": args.horizon,
+               "min_depth": min_depths[0], "depth_mode": depth_modes[0]}]
+        for mode in depth_modes:
+            for md in min_depths:
+                for g in gammas:
+                    for w in weights_pos:
+                        jl.append({"cell_idx": ci, "count": count, "frac": frac, "seed": seed,
+                                   "baseline": False, "weight": w, "gamma": g,
+                                   "horizon": args.horizon, "min_depth": md, "depth_mode": mode})
+        per_cell_jobs.append(jl)
+    jobs = [j for wave in zip_longest(*per_cell_jobs) for j in wave if j is not None]
+    total_runs = len(jobs)
 
-    # Live grid board (default): a ✓/▶/· per (count, frac) cell, redrawn ~2x/s by a ticker
+    counter = Value("i", 0)
+    status = Array("b", total)               # per cell; 0=pending 1=running 2=done
+    for i in range(total):
+        status[i] = 1                        # every cell is in flight from the start (no idle worker)
+
+    # Live grid board (unchanged form): a ✓/▶/· per (count, frac) cell, redrawn ~2x/s by a ticker
     # thread. --verbose falls back to a scrolling per-cell line.
-    board = None if args.verbose else GridBoard(counts, fracs, total_units, status, counter)
+    board = None if args.verbose else GridBoard(counts, fracs, total_runs, status, counter)
     stop_tick = threading.Event()
     if board is not None:
         board.draw()
@@ -538,38 +538,38 @@ def main():
                 board.draw()
         threading.Thread(target=_tick, daemon=True).start()
 
+    cell_done = [0] * total
+    rows_by_cell = {ci: [] for ci in range(total)}
+
     def absorb(res):
-        all_rows.extend(res["rows"])
-        episode_videos[res["episode"]] = res["videos"]
+        ci, row = res["cell_idx"], res["row"]
+        all_rows.append(row)
+        rows_by_cell[ci].append(row)
         with open(csv_path, "a", newline="", encoding="utf-8") as fh:
-            csv.DictWriter(fh, fieldnames=csv_fields).writerows(res["rows"])
-        if board is not None:
-            board.draw()
-        else:
-            c, f = res["cell"]
-            done = len(episode_videos)
-            elapsed = time.perf_counter() - t0
-            eta = (elapsed / done * (total - done)) if done else 0.0
-            vid = f" videos={len(res['videos'])}" if res["videos"] else ""
-            print(f"[{done:>3}/{total} {100 * done / total:4.0f}%] ep{res['episode']:03d} "
-                  f"{c} AMRs frac {f:.1f} done ({len(res['rows'])} lambdas){vid}"
-                  f"  | elapsed {elapsed / 60:.1f}m  eta {eta / 60:.1f}m", flush=True)
+            csv.DictWriter(fh, fieldnames=csv_fields).writerow(row)
+        cell_done[ci] += 1
+        counter.value += 1
+        if cell_done[ci] >= runs_per_cell:
+            status[ci] = 2                   # all of this cell's runs done -> check mark
+            if board is None:
+                nd = sum(1 for d in cell_done if d >= runs_per_cell)
+                el = time.perf_counter() - t0
+                print(f"[{nd:>2}/{total}] cell {ci} ({row['num_agents']} AMRs frac {row['frac']:.1f}) "
+                      f"done | {counter.value}/{total_runs} runs | elapsed {el / 60:.1f}m", flush=True)
 
     interrupted = False
     if workers == 1:
         try:
-            for episode_id in range(total):
-                absorb(generate_episode(env, episode_id, args, str(out_dir)))
+            for job in jobs:
+                absorb(run_job(job, args))
         except KeyboardInterrupt:
             interrupted = True
-            print("\n[interrupted] stopped; partial metrics.csv + finished videos are kept.", flush=True)
+            print("\n[interrupted] stopped; partial metrics.csv is kept.", flush=True)
     else:
-        # Explicit pool (not `with`): on Ctrl+C, terminate workers immediately instead of
-        # blocking until in-flight cells finish (which is why Ctrl+C felt dead before).
-        pool = ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(counter, status))
+        # Explicit pool (not `with`): on Ctrl+C, terminate workers immediately.
+        pool = ProcessPoolExecutor(max_workers=workers, initializer=_init_worker)
         try:
-            futs = {pool.submit(generate_episode, env, eid, args, str(out_dir)): eid
-                    for eid in range(total)}
+            futs = [pool.submit(run_job, job, args) for job in jobs]
             for fut in as_completed(futs):
                 absorb(fut.result())
             pool.shutdown()
@@ -584,6 +584,48 @@ def main():
     if board is not None:
         board.draw()
         print()                                  # drop below the board for the summary
+    cells_done = sum(1 for d in cell_done if d >= runs_per_cell)
+
+    # ---- videos (separate phase): per (cell, gamma) best-lambda for the PRIMARY config.
+    # Re-runs the chosen configs deterministically (same seed) instead of shipping path arrays;
+    # rendered in parallel across cells.
+    if not args.no_video and weights_pos and not interrupted:
+        prim_mode, prim_md = depth_modes[0], min_depths[0]
+        vjobs = []
+        for ci, (count, frac) in enumerate(grid):
+            best_by_gamma = {}
+            for g in gammas:
+                cand = [r for r in rows_by_cell[ci] if r["depth_mode"] == prim_mode
+                        and r["min_depth"] == prim_md and r["gamma"] == g]
+                if cand:
+                    best_by_gamma[g] = max(cand, key=lambda r: r["deliveries"])["weight"]
+            if best_by_gamma:
+                vjobs.append({"cell_idx": ci, "count": count, "frac": frac,
+                              "seed": args.base_seed + ci, "best_by_gamma": best_by_gamma,
+                              "prim_mode": prim_mode, "prim_md": prim_md, "horizon": args.horizon})
+        print(f"\nrendering videos for {len(vjobs)} cells (vanilla | best-lambda per gamma; "
+              f"configs re-run deterministically)...", flush=True)
+        vdone = [0]
+
+        def absorb_v(res):
+            episode_videos[res["cell_idx"]] = res["videos"]
+            vdone[0] += 1
+            print(f"  [{vdone[0]:>2}/{len(vjobs)}] cell {res['cell_idx']}: {len(res['videos'])} videos",
+                  flush=True)
+        try:
+            if workers == 1:
+                for vj in vjobs:
+                    absorb_v(video_job(vj, args, str(out_dir)))
+            else:
+                vpool = ProcessPoolExecutor(max_workers=workers, initializer=_init_worker)
+                vfuts = [vpool.submit(video_job, vj, args, str(out_dir)) for vj in vjobs]
+                for fut in as_completed(vfuts):
+                    absorb_v(fut.result())
+                vpool.shutdown()
+        except KeyboardInterrupt:
+            print("\n[interrupted] video phase stopped (metrics already saved).", flush=True)
+        except Exception as exc:  # noqa: BLE001  (videos are optional; never lose the metrics)
+            print(f"[videos skipped] {exc!r}", flush=True)
 
     # ---- metadata.json ----
     (out_dir / "metadata.json").write_text(json.dumps({
@@ -593,15 +635,15 @@ def main():
         "horizon": args.horizon, "predict_every": args.predict_every,
         "seconds": args.seconds, "base_seed": args.base_seed,
         "congestion_center_value": args.center_value, "congestion_step_value": args.step_value,
-        "cells": total, "cells_completed": len(episode_videos), "interrupted": interrupted,
-        "runs": total * runs_per_cell,
+        "cells": total, "cells_completed": cells_done, "interrupted": interrupted,
+        "runs": total_runs,
         "elapsed_min": (time.perf_counter() - t0) / 60.0,
         "episode_videos": episode_videos,
     }, indent=2), encoding="utf-8")
 
     # ---- aggregate by weight (mean over completed cells) ----
     if all_rows:
-        print(f"\n=== mean over {len(episode_videos)}/{total} completed cells, by congestion weight ===")
+        print(f"\n=== mean over {cells_done}/{total} completed cells, by congestion weight ===")
         hdr = (f"{'lam':>5} | {'deliv':>6} {'energy':>8} {'e/deliv':>7} {'unifrm':>6} "
                f"{'occCV':>5} {'cong@r':>6} {'p99':>6} {'coll':>4}")
         print(hdr); print("-" * len(hdr))
@@ -636,7 +678,7 @@ def main():
     # save the by-lambda table as an image too (out_dir; rides along when moved below)
     if all_rows:
         try:
-            save_metrics_table_png(all_rows, weights, len(episode_videos), out_dir / "metrics_table.png")
+            save_metrics_table_png(all_rows, weights, cells_done, out_dir / "metrics_table.png")
         except Exception as exc:  # noqa: BLE001
             print(f"[metrics table png skipped] {exc!r}")
 
@@ -647,7 +689,7 @@ def main():
     print(f"report  -> {out_dir}")
     print(f"{'INTERRUPTED — ' if interrupted else ''}elapsed "
           f"{(time.perf_counter() - t0) / 60.0:.1f} min "
-          f"({len(episode_videos)}/{total} cells)")
+          f"({cells_done}/{total} cells)")
     if interrupted:
         # hard-exit so a half-torn-down process pool can't hang the interpreter at shutdown
         sys.stdout.flush()
