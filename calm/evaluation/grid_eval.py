@@ -293,12 +293,12 @@ _RUNNING = None        # pid -> label of the run this worker is doing now (for t
 
 
 def _job_label(job):
-    """Short human label of a run: 'n300 f0.0  peaked md1 g0.61 λ0.5' / '... baseline'."""
+    """Short human label of a run: 'n300 f0.0  peaked md1 g0.61 λ0.5 pe1' / '... baseline'."""
     head = f"n{job['count']:>3} f{job['frac']:.1f}"
     if job["baseline"]:
         return f"{head}  baseline"
     return (f"{head}  {job['depth_mode']:>9} md{job['min_depth']} "
-            f"g{job['gamma']:g} λ{job['weight']:g}")
+            f"g{job['gamma']:g} λ{job['weight']:g} pe{job['predict_every']:g}")
 
 
 def get_env():
@@ -334,17 +334,18 @@ def run_job(job, args):
         cfg = _cell_cfg(job["count"], job["frac"], job["seed"], args)
         starts, _ = mapf.select_start_goal_pairs(env, walkable, cfg)
         weight = 0.0 if job["baseline"] else job["weight"]
-        _, _, m = solve(weight, env, cfg, starts, args.predict_every,
+        _, _, m = solve(weight, env, cfg, starts, job["predict_every"],
                         gamma=job["gamma"], horizon=job["horizon"],
                         min_depth=job["min_depth"], depth_mode=job["depth_mode"])
         if job["baseline"]:
             row = {"episode": job["cell_idx"], "num_agents": job["count"], "frac": job["frac"],
                    "gamma": "", "horizon": job["horizon"], "min_depth": "", "depth_mode": "baseline",
-                   "weight": 0.0, "seed": job["seed"], **m}
+                   "weight": 0.0, "predict_every": "", "seed": job["seed"], **m}
         else:
             row = {"episode": job["cell_idx"], "num_agents": job["count"], "frac": job["frac"],
                    "gamma": job["gamma"], "horizon": job["horizon"], "min_depth": job["min_depth"],
-                   "depth_mode": job["depth_mode"], "weight": job["weight"], "seed": job["seed"], **m}
+                   "depth_mode": job["depth_mode"], "weight": job["weight"],
+                   "predict_every": job["predict_every"], "seed": job["seed"], **m}
         return {"cell_idx": job["cell_idx"], "row": row}
     finally:
         if _RUNNING is not None:
@@ -366,6 +367,7 @@ def video_job(vjob, args, out_dir_str):
     cfg = _cell_cfg(vjob["count"], vjob["frac"], vjob["seed"], args)
     starts, _ = mapf.select_start_goal_pairs(env, walkable, cfg)
     prim_mode, prim_md, horizon = vjob["prim_mode"], vjob["prim_md"], vjob["horizon"]
+    prim_pe = vjob.get("prim_pe", args.predict_every)   # the swept predict_every the videos use
     best_by_gamma = vjob["best_by_gamma"]
 
     vdir = Path(out_dir_str) / "videos"
@@ -381,7 +383,7 @@ def video_job(vjob, args, out_dir_str):
 
     # vanilla (lambda 0) -- shared across every gamma in this cell
     base_paths, base_summary, _ = solve(
-        0.0, env, cfg, starts, args.predict_every,
+        0.0, env, cfg, starts, prim_pe,
         gamma=next(iter(best_by_gamma)), horizon=horizon, min_depth=prim_md, depth_mode=prim_mode)
     van_move = _animate_scenario(env, starts, clip(base_paths), base_summary,
                                  anim_cfg, tmp / "van_move.mp4", tmp / "vm")
@@ -389,13 +391,13 @@ def video_job(vjob, args, out_dir_str):
     van_act = van_pred = None
     if composite:
         van_act = mapf.build_additive_congestion_label_sequence(ap_base, H, W, cv, sv)
-        van_pred = _predict_congestion_sequence(van_act, predictor, args.predict_every)
+        van_pred = _predict_congestion_sequence(van_act, predictor, prim_pe)
 
     # each gamma's congestion-aware run (movement now; fields kept for a shared colour scale)
     runs = []
     for g in sorted(best_by_gamma):
         w = best_by_gamma[g]
-        cpaths, csumm, _ = solve(w, env, cfg, starts, args.predict_every,
+        cpaths, csumm, _ = solve(w, env, cfg, starts, prim_pe,
                                  gamma=g, horizon=horizon, min_depth=prim_md, depth_mode=prim_mode)
         app_move = _animate_scenario(env, starts, clip(cpaths), csumm, anim_cfg,
                                      tmp / f"app_move_g{g:g}.mp4", tmp / f"am{g:g}")
@@ -403,7 +405,7 @@ def video_job(vjob, args, out_dir_str):
         if composite:
             d["ap"] = mapf.paths_to_agent_positions(cpaths, vs)
             d["act"] = mapf.build_additive_congestion_label_sequence(d["ap"], H, W, cv, sv)
-            d["pred"] = _predict_congestion_sequence(d["act"], predictor, args.predict_every)
+            d["pred"] = _predict_congestion_sequence(d["act"], predictor, prim_pe)
         runs.append(d)
 
     names = []
@@ -630,6 +632,12 @@ def parse_args():
                     help="MPC re-predict period; default = 11 - horizon (keeps full-depth lookahead, "
                          "handoff section 4). Raising it is cheaper but the penalty fades late in "
                          "each window.")
+    ap.add_argument("--predict-everys", type=int, nargs="+", default=None,
+                    help="sweep axis for the MPC re-predict period, e.g. '1 2 5 10'. When given, every "
+                         "congestion run is also solved at each value (multiplies the grid like gammas / "
+                         "min-depths). Omitted = a single value taken from --predict-every. Deliveries are "
+                         "largely flat across this axis while wall time drops, so it mainly maps the "
+                         "speed/quality trade-off. Each value is clamped to [1, 10].")
     ap.add_argument("--no-video", action="store_true", help="metrics only, skip MP4s")
     # --- MACPF animate_paths knobs (videos) ---
     ap.add_argument("--anim-subframes", type=int, default=1,
@@ -682,6 +690,10 @@ def main():
     args.horizon = max(1, min(10, int(args.horizon)))
     if args.predict_every is None:
         args.predict_every = max(1, 11 - args.horizon)   # full-depth lookahead (handoff section 4)
+    # predict_every sweep axis: explicit --predict-everys, else the single --predict-every value.
+    # Clamp to [1, 10] (>10 leaves late steps with no forecast frame; the solver clamps too).
+    predict_everys = sorted({max(1, min(10, int(pe)))
+                             for pe in (args.predict_everys or [args.predict_every])})
     counts, fracs = agent_count_sweep(args), frac_sweep(args)
     grid = grid_cells(args)
     weights = sorted(args.weights)
@@ -693,14 +705,14 @@ def main():
     (out_dir / "videos").mkdir(parents=True, exist_ok=True)
     env = fmg.build_factory_map()
 
-    # per cell: 1 baseline (lambda=0) + (depth_mode x min_depth x gamma x lambda>0) congestion runs
-    cong_per_cell = len(depth_modes) * len(min_depths) * len(gammas) * len(weights_pos)
+    # per cell: 1 baseline (lambda=0) + (depth_mode x min_depth x gamma x lambda>0 x predict_every) runs
+    cong_per_cell = len(depth_modes) * len(min_depths) * len(gammas) * len(weights_pos) * len(predict_everys)
     runs_per_cell = 1 + cong_per_cell
     n_vid = 0 if (args.no_video or not weights_pos) else len(grid) * len(gammas)
     print(f"grid: counts {counts} x fracs {fracs} | lambdas {weights} x gammas {gammas} "
-          f"| min_depths {min_depths} x depth_modes {depth_modes}")
+          f"| min_depths {min_depths} x depth_modes {depth_modes} | predict_everys {predict_everys}")
     print(f"  = {len(grid)} cells x {runs_per_cell} runs = {len(grid) * runs_per_cell} planner runs "
-          f"| horizon {args.horizon} | predict_every {args.predict_every}"
+          f"| horizon {args.horizon}"
           f"{'' if args.no_video else f'  (+{n_vid} MP4s: vanilla vs best-lambda per gamma)'}", flush=True)
     print(f"output -> {out_dir}\n", flush=True)
 
@@ -713,7 +725,7 @@ def main():
     # (and the per-cell MP4s are likewise already on disk).
     csv_path = out_dir / "metrics.csv"
     csv_fields = ["episode", "num_agents", "frac", "gamma", "horizon", "min_depth", "depth_mode",
-                  "weight", "seed", "deliveries", "energy", "energy_per_delivery",
+                  "weight", "predict_every", "seed", "deliveries", "energy", "energy_per_delivery",
                   "density_uniformity", "occ_cv", "mean_robot_cong", "p99_cong", "peak_cong",
                   "collisions", "preds", "wall_s"]
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
@@ -731,14 +743,17 @@ def main():
         seed = args.base_seed + ci               # per-cell seed, shared by that cell's runs (A/B)
         jl = [{"cell_idx": ci, "count": count, "frac": frac, "seed": seed, "baseline": True,
                "weight": 0.0, "gamma": gammas[0], "horizon": args.horizon,
-               "min_depth": min_depths[0], "depth_mode": depth_modes[0]}]
+               "min_depth": min_depths[0], "depth_mode": depth_modes[0],
+               "predict_every": predict_everys[0]}]
         for mode in depth_modes:
             for md in min_depths:
                 for g in gammas:
                     for w in weights_pos:
-                        jl.append({"cell_idx": ci, "count": count, "frac": frac, "seed": seed,
-                                   "baseline": False, "weight": w, "gamma": g,
-                                   "horizon": args.horizon, "min_depth": md, "depth_mode": mode})
+                        for pe in predict_everys:
+                            jl.append({"cell_idx": ci, "count": count, "frac": frac, "seed": seed,
+                                       "baseline": False, "weight": w, "gamma": g,
+                                       "horizon": args.horizon, "min_depth": md, "depth_mode": mode,
+                                       "predict_every": pe})
         per_cell_jobs.append(jl)
     jobs = [j for wave in zip_longest(*per_cell_jobs) for j in wave if j is not None]
     total_runs = len(jobs)
@@ -822,19 +837,21 @@ def main():
     # Re-runs the chosen configs deterministically (same seed) instead of shipping path arrays;
     # rendered in parallel across cells.
     if not args.no_video and weights_pos and not interrupted:
-        prim_mode, prim_md = depth_modes[0], min_depths[0]
+        prim_mode, prim_md, prim_pe = depth_modes[0], min_depths[0], predict_everys[0]
         vjobs = []
         for ci, (count, frac) in enumerate(grid):
             best_by_gamma = {}
             for g in gammas:
                 cand = [r for r in rows_by_cell[ci] if r["depth_mode"] == prim_mode
-                        and r["min_depth"] == prim_md and r["gamma"] == g]
+                        and r["min_depth"] == prim_md and r["gamma"] == g
+                        and r["predict_every"] == prim_pe]
                 if cand:
                     best_by_gamma[g] = max(cand, key=lambda r: r["deliveries"])["weight"]
             if best_by_gamma:
                 vjobs.append({"cell_idx": ci, "count": count, "frac": frac,
                               "seed": args.base_seed + ci, "best_by_gamma": best_by_gamma,
-                              "prim_mode": prim_mode, "prim_md": prim_md, "horizon": args.horizon})
+                              "prim_mode": prim_mode, "prim_md": prim_md, "prim_pe": prim_pe,
+                              "horizon": args.horizon})
         print(f"\nrendering videos for {len(vjobs)} cells (vanilla | best-lambda per gamma; "
               f"configs re-run deterministically)...", flush=True)
         vdone = [0]
@@ -865,6 +882,7 @@ def main():
         "counts": counts, "fracs": fracs, "weights": weights,
         "gammas": gammas, "min_depths": min_depths, "depth_modes": depth_modes,
         "horizon": args.horizon, "predict_every": args.predict_every,
+        "predict_everys": predict_everys,
         "seconds": args.seconds, "base_seed": args.base_seed,
         "congestion_center_value": args.center_value, "congestion_step_value": args.step_value,
         "cells": total, "cells_completed": cells_done, "interrupted": interrupted,
@@ -899,30 +917,30 @@ def main():
             print(f"\n{tag}")
             _print_lambda_table(crows, weights, indent="    ", base_mean=cbm)
 
-    # (3) best lambda per (depth_mode, min_depth, gamma): compact winner summary
+    # (3) best lambda per (depth_mode, min_depth, gamma, predict_every): compact winner summary
     if cong_rows:
         bm = base_mean if base_mean is not None else float("nan")
-        print(f"\n=== best lambda per gamma (mean deliveries over cells; baseline {bm:.1f}) ===")
-        hdr = f"{'mode':>9} {'md':>3} {'gamma':>6} | {'best lam':>8} {'deliv':>6} {'d-base':>7}"
+        print(f"\n=== best lambda per (gamma, predict_every) (mean deliveries over cells; baseline {bm:.1f}) ===")
+        hdr = f"{'mode':>9} {'md':>3} {'gamma':>6} {'pe':>3} | {'best lam':>8} {'deliv':>6} {'d-base':>7}"
         print(hdr); print("-" * len(hdr))
-        for combo in sorted({(r["depth_mode"], r["min_depth"], r["gamma"]) for r in cong_rows}):
-            mode, md, g = combo
+        for combo in sorted({(r["depth_mode"], r["min_depth"], r["gamma"], r["predict_every"]) for r in cong_rows}):
+            mode, md, g, pe = combo
             by_w = {}
             for r in cong_rows:
-                if (r["depth_mode"], r["min_depth"], r["gamma"]) == combo:
+                if (r["depth_mode"], r["min_depth"], r["gamma"], r["predict_every"]) == combo:
                     by_w.setdefault(r["weight"], []).append(r["deliveries"])
             best_w = max(by_w, key=lambda w: float(np.mean(by_w[w])))
             best_d = float(np.mean(by_w[best_w]))
-            print(f"{mode:>9} {md:>3} {g:>6g} | {best_w:>8g} {best_d:>6.1f} {best_d - bm:>+7.1f}")
+            print(f"{mode:>9} {md:>3} {g:>6g} {pe:>3g} | {best_w:>8g} {best_d:>6.1f} {best_d - bm:>+7.1f}")
 
-    # (4) full lambda sweep per (depth_mode, min_depth, gamma): all lambdas, full metrics
+    # (4) full lambda sweep per (depth_mode, min_depth, gamma, predict_every): all lambdas, full metrics
     if cong_rows:
-        print(f"\n=== full lambda sweep per (mode, md, gamma) (mean over cells) ===")
-        for combo in sorted({(r["depth_mode"], r["min_depth"], r["gamma"]) for r in cong_rows}):
-            mode, md, g = combo
+        print(f"\n=== full lambda sweep per (mode, md, gamma, predict_every) (mean over cells) ===")
+        for combo in sorted({(r["depth_mode"], r["min_depth"], r["gamma"], r["predict_every"]) for r in cong_rows}):
+            mode, md, g, pe = combo
             grp = [r for r in cong_rows
-                   if (r["depth_mode"], r["min_depth"], r["gamma"]) == combo]
-            print(f"\n  [mode={mode}  md={md}  gamma={g:g}]")
+                   if (r["depth_mode"], r["min_depth"], r["gamma"], r["predict_every"]) == combo]
+            print(f"\n  [mode={mode}  md={md}  gamma={g:g}  pe={pe:g}]")
             _print_lambda_table(grp, weights_pos, indent="    ", base_mean=base_mean)
 
     # save the by-lambda table as an image too (out_dir; rides along when moved below)
