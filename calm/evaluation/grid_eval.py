@@ -341,8 +341,8 @@ def save_metrics_table_png(rows, weights, n_cells, out_path):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    cols = ["lambda", "deliveries", "energy", "energy/deliv", "uniformity",
-            "occ_cv", "cong@robot", "p99 cong", "collisions"]
+    cols = ["lambda", "deliveries", "±sd", "energy", "energy/deliv", "uniformity",
+            "occ_cv", "cong@robot", "p99 cong", "peak cong", "preds", "collisions"]
     body, best = [], {}
     # remember the best (max deliveries, max uniformity, min congestion) for highlighting
     for w in weights:
@@ -350,10 +350,13 @@ def save_metrics_table_png(rows, weights, n_cells, out_path):
         if not sub:
             continue
         m = lambda k: float(np.mean([r[k] for r in sub]))
-        body.append([f"{w:g}", f"{m('deliveries'):.1f}", f"{m('energy'):.0f}",
+        dv = [r["deliveries"] for r in sub]
+        sd = float(np.std(dv)) if len(dv) > 1 else 0.0
+        body.append([f"{w:g}", f"{m('deliveries'):.1f}", f"{sd:.1f}", f"{m('energy'):.0f}",
                      f"{m('energy_per_delivery'):.1f}", f"{m('density_uniformity'):.3f}",
                      f"{m('occ_cv'):.2f}", f"{m('mean_robot_cong'):.1f}",
-                     f"{m('p99_cong'):.0f}", f"{int(sum(r['collisions'] for r in sub))}"])
+                     f"{m('p99_cong'):.0f}", f"{m('peak_cong'):.0f}", f"{m('preds'):.0f}",
+                     f"{int(sum(r['collisions'] for r in sub))}"])
 
     fig, ax = plt.subplots(figsize=(1.35 * len(cols), 0.7 + 0.45 * (len(body) + 1)))
     ax.axis("off")
@@ -369,6 +372,45 @@ def save_metrics_table_png(rows, weights, n_cells, out_path):
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def _print_lambda_table(rows, weights, indent="", base_mean=None):
+    """Print a per-lambda aggregate of `rows` (mean over whatever cells/configs they span).
+
+    Columns mirror the CSV metrics, plus the across-row std of deliveries (±sd) and,
+    when `base_mean` is given, the delivery gain over baseline (d-base)."""
+    has_base = base_mean is not None
+    cols = [("deliv", 7), ("±sd", 5)]
+    if has_base:
+        cols.append(("d-base", 7))
+    cols += [("energy", 8), ("e/dlv", 7), ("unifrm", 6), ("occCV", 5),
+             ("cong@r", 6), ("p99", 6), ("peak", 6), ("preds", 6), ("wall", 6), ("coll", 4)]
+    hdr = f"{indent}{'lam':>5} | " + " ".join(f"{n:>{w}}" for n, w in cols)
+    print(hdr)
+    print(f"{indent}{'-' * (len(hdr) - len(indent))}")
+    for lam in weights:
+        sub = [r for r in rows if r["weight"] == lam]
+        if not sub:
+            continue
+        dv = [r["deliveries"] for r in sub]
+        mean = lambda k: float(np.mean([r[k] for r in sub]))
+        sd = float(np.std(dv)) if len(dv) > 1 else 0.0
+        vals = {
+            "deliv":  f"{float(np.mean(dv)):>7.1f}",
+            "±sd":    f"{sd:>5.1f}",
+            "d-base": f"{(float(np.mean(dv)) - base_mean):>+7.1f}" if has_base else "",
+            "energy": f"{mean('energy'):>8.0f}",
+            "e/dlv":  f"{mean('energy_per_delivery'):>7.2f}",
+            "unifrm": f"{mean('density_uniformity'):>6.3f}",
+            "occCV":  f"{mean('occ_cv'):>5.2f}",
+            "cong@r": f"{mean('mean_robot_cong'):>6.1f}",
+            "p99":    f"{mean('p99_cong'):>6.0f}",
+            "peak":   f"{mean('peak_cong'):>6.0f}",
+            "preds":  f"{mean('preds'):>6.0f}",
+            "wall":   f"{mean('wall_s'):>6.1f}",
+            "coll":   f"{int(sum(r['collisions'] for r in sub)):>4}",
+        }
+        print(f"{indent}{lam:>5.2f} | " + " ".join(vals[n] for n, _ in cols))
 
 
 class GridBoard:
@@ -702,28 +744,36 @@ def main():
         "episode_videos": episode_videos,
     }, indent=2), encoding="utf-8")
 
-    # ---- aggregate by weight (mean over completed cells) ----
+    # ---- detailed aggregates over completed cells ----
+    cong_rows = [r for r in all_rows if r["depth_mode"] != "baseline"]
+    base_rows = [r for r in all_rows if r["depth_mode"] == "baseline"]
+    base_mean = float(np.mean([r["deliveries"] for r in base_rows])) if base_rows else None
+
+    # (1) headline: mean over every completed cell, by congestion weight
     if all_rows:
         print(f"\n=== mean over {cells_done}/{total} completed cells, by congestion weight ===")
-        hdr = (f"{'lam':>5} | {'deliv':>6} {'energy':>8} {'e/deliv':>7} {'unifrm':>6} "
-               f"{'occCV':>5} {'cong@r':>6} {'p99':>6} {'coll':>4}")
-        print(hdr); print("-" * len(hdr))
-        for w in weights:
-            sub = [r for r in all_rows if r["weight"] == w]
-            if not sub:
-                continue
-            mean = lambda k: float(np.mean([r[k] for r in sub]))
-            print(f"{w:>5.2f} | {mean('deliveries'):>6.1f} {mean('energy'):>8.0f} "
-                  f"{mean('energy_per_delivery'):>7.2f} {mean('density_uniformity'):>6.3f} "
-                  f"{mean('occ_cv'):>5.2f} {mean('mean_robot_cong'):>6.1f} {mean('p99_cong'):>6.0f} "
-                  f"{int(sum(r['collisions'] for r in sub)):>4}")
+        _print_lambda_table(all_rows, weights, base_mean=base_mean)
 
-    # ---- best lambda per (depth_mode, min_depth, gamma): section-5 fair comparison ----
-    cong_rows = [r for r in all_rows if r["depth_mode"] != "baseline"]
+    # (2) per (count, frac) cell: by congestion weight (mean over mode/md/gamma within the cell)
+    if all_rows:
+        print(f"\n=== per (count, frac) cell, by congestion weight ===")
+        for ci in sorted(rows_by_cell):
+            crows = rows_by_cell[ci]
+            if not crows:
+                continue
+            count, frac = grid[ci]
+            cbase = [r["deliveries"] for r in crows if r["depth_mode"] == "baseline"]
+            cbm = float(np.mean(cbase)) if cbase else None
+            tag = f"  [count={count}  frac={frac:g}]"
+            if cbm is not None:
+                tag += f"  baseline deliv={cbm:.1f}"
+            print(f"\n{tag}")
+            _print_lambda_table(crows, weights, indent="    ", base_mean=cbm)
+
+    # (3) best lambda per (depth_mode, min_depth, gamma): compact winner summary
     if cong_rows:
-        base_rows = [r for r in all_rows if r["depth_mode"] == "baseline"]
-        base_mean = float(np.mean([r["deliveries"] for r in base_rows])) if base_rows else float("nan")
-        print(f"\n=== best lambda per gamma (mean deliveries over cells; baseline {base_mean:.1f}) ===")
+        bm = base_mean if base_mean is not None else float("nan")
+        print(f"\n=== best lambda per gamma (mean deliveries over cells; baseline {bm:.1f}) ===")
         hdr = f"{'mode':>9} {'md':>3} {'gamma':>6} | {'best lam':>8} {'deliv':>6} {'d-base':>7}"
         print(hdr); print("-" * len(hdr))
         for combo in sorted({(r["depth_mode"], r["min_depth"], r["gamma"]) for r in cong_rows}):
@@ -734,7 +784,17 @@ def main():
                     by_w.setdefault(r["weight"], []).append(r["deliveries"])
             best_w = max(by_w, key=lambda w: float(np.mean(by_w[w])))
             best_d = float(np.mean(by_w[best_w]))
-            print(f"{mode:>9} {md:>3} {g:>6g} | {best_w:>8g} {best_d:>6.1f} {best_d - base_mean:>+7.1f}")
+            print(f"{mode:>9} {md:>3} {g:>6g} | {best_w:>8g} {best_d:>6.1f} {best_d - bm:>+7.1f}")
+
+    # (4) full lambda sweep per (depth_mode, min_depth, gamma): all lambdas, full metrics
+    if cong_rows:
+        print(f"\n=== full lambda sweep per (mode, md, gamma) (mean over cells) ===")
+        for combo in sorted({(r["depth_mode"], r["min_depth"], r["gamma"]) for r in cong_rows}):
+            mode, md, g = combo
+            grp = [r for r in cong_rows
+                   if (r["depth_mode"], r["min_depth"], r["gamma"]) == combo]
+            print(f"\n  [mode={mode}  md={md}  gamma={g:g}]")
+            _print_lambda_table(grp, weights_pos, indent="    ", base_mean=base_mean)
 
     # save the by-lambda table as an image too (out_dir; rides along when moved below)
     if all_rows:
