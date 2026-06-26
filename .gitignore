@@ -17,6 +17,10 @@ dist/
 !/reports/**/
 !/reports/**/.gitkeep
 
+# Per-run write-up: generated into each dated report folder (already covered by
+# /reports/** above). A stray copy at the repo root is a run artifact, not source.
+/analysis_summary.md
+
 # Never upload these regardless of folder
 *.npz
 *.zip
