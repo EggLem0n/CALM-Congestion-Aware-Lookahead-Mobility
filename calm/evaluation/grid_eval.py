@@ -932,8 +932,20 @@ def main():
         except Exception as exc:  # noqa: BLE001
             print(f"[metrics table png skipped] {exc!r}")
 
+    # per-run write-up + glossary, dropped into this run's dated folder (never fatal)
+    summary_md = None
+    if all_rows:
+        try:
+            from make_analysis_summary import write_run_reports
+            summary_md, _ = write_run_reports(out_dir)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[analysis summary skipped] {exc!r}")
+
     print(f"\nmetrics -> {out_dir / 'metrics.csv'}")
     print(f"table   -> {out_dir / 'metrics_table.png'}")
+    if summary_md is not None:
+        print(f"summary -> {summary_md}")
+        print(f"glossary-> {out_dir / 'metrics_glossary.md'}")
     if not args.no_video:
         print(f"videos  -> {out_dir / 'videos'}")
     print(f"report  -> {out_dir}")
