@@ -51,6 +51,75 @@ def _episode_id(npz_path: Path) -> int:
     return int(npz_path.stem.split("_")[1])
 
 
+def render_congestion_video(
+    congestion: np.ndarray,
+    positions: np.ndarray,
+    obstacle: np.ndarray,
+    out_path,
+    *,
+    fps: int = 30,
+    stride: int = 1,
+    dpi: int = 100,
+    vmax: Optional[float] = None,
+    vmax_pct: float = 99.0,
+    codec: str = "libx264",
+    label: str = "",
+    title_fmt: Optional[str] = None,
+) -> float:
+    """Animate a (T,H,W) congestion field ("hot") + (T,N,2) AMR scatter over an
+    (H,W) obstacle background to ``out_path``; returns the vmax used.
+
+    ``congestion`` may be (T,1,H,W) or (T,H,W). With ``vmax=None`` the colour scale
+    is the ``vmax_pct`` percentile of positive congestion (so a single hot cell can't
+    wash out the map); pass a shared ``vmax`` to make two clips colour-comparable.
+    ``label`` is drawn (static) top-left; ``title_fmt`` may use {t}/{T}/{agents}."""
+    cong = np.asarray(congestion)
+    if cong.ndim == 4:                  # (T,1,H,W) -> (T,H,W)
+        cong = cong[:, 0]
+    T, H, W = cong.shape
+    positions = np.asarray(positions)
+    obstacle = np.asarray(obstacle).astype(np.float32)
+
+    if vmax is None:
+        pos_vals = cong[cong > 0]
+        vmax = float(np.percentile(pos_vals, vmax_pct)) if pos_vals.size else 1.0
+    vmax = max(float(vmax), 1.0)
+
+    fig, ax = plt.subplots(figsize=(W / 10.0, H / 10.0))
+    ax.set_xlim(-0.5, W - 0.5)
+    ax.set_ylim(H - 0.5, -0.5)  # origin='upper' to match array row order
+    ax.set_xticks([])
+    ax.set_yticks([])
+    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0)
+
+    # Static obstacle background (walls drawn faint gray under the heatmap).
+    ax.imshow(obstacle, cmap="binary", vmin=0.0, vmax=1.0, alpha=0.30,
+              interpolation="nearest", zorder=0)
+
+    heat = ax.imshow(np.ma.masked_less_equal(cong[0], 0.0), cmap="hot",
+                     vmin=0.0, vmax=vmax, interpolation="nearest", zorder=1)
+    scat = ax.scatter(positions[0, :, 0], positions[0, :, 1],
+                      s=6, c="cyan", edgecolors="black", linewidths=0.3, zorder=2)
+    txt = None
+    if label or title_fmt:
+        txt = ax.text(0.01, 0.99, "", transform=ax.transAxes, va="top", ha="left",
+                      color="white", fontsize=8,
+                      bbox=dict(facecolor="black", alpha=0.4, pad=2), zorder=3)
+
+    n_agents = positions.shape[1]
+    writer = FFMpegWriter(fps=fps, codec=codec, extra_args=["-pix_fmt", "yuv420p"])
+    with writer.saving(fig, str(out_path), dpi=dpi):
+        for t in range(0, T, stride):
+            heat.set_data(np.ma.masked_less_equal(cong[t], 0.0))
+            scat.set_offsets(positions[t])
+            if txt is not None:
+                line = title_fmt.format(t=t, T=T - 1, agents=n_agents) if title_fmt else ""
+                txt.set_text(f"{label}  {line}".strip())
+            writer.grab_frame()
+    plt.close(fig)
+    return vmax
+
+
 def render_one(
     npz_path_str: str,
     obstacle_path_str: str,
@@ -73,50 +142,12 @@ def render_one(
     y = data["y"]                       # (T, 1, H, W) float32 congestion
     positions = data["agent_positions"] # (T, N, 2) int16 -> [col, row]
     obstacle = np.load(obstacle_path_str).astype(np.float32)  # (H, W)
-
     T = y.shape[0]
-    H, W = y.shape[2], y.shape[3]
 
-    # Per-episode color scale: a high percentile of positive congestion avoids a single
-    # hot cell washing out the map. Fall back to 1.0 when the episode has no congestion.
-    if vmax_fixed is not None:
-        vmax = float(vmax_fixed)
-    else:
-        pos_vals = y[y > 0]
-        vmax = float(np.percentile(pos_vals, vmax_pct)) if pos_vals.size else 1.0
-        vmax = max(vmax, 1.0)
-
-    fig, ax = plt.subplots(figsize=(W / 10.0, H / 10.0))
-    ax.set_xlim(-0.5, W - 0.5)
-    ax.set_ylim(H - 0.5, -0.5)  # origin='upper' to match array row order
-    ax.set_xticks([])
-    ax.set_yticks([])
-    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0)
-
-    # Static obstacle background (walls drawn faint gray under the heatmap).
-    ax.imshow(obstacle, cmap="binary", vmin=0.0, vmax=1.0, alpha=0.30,
-              interpolation="nearest", zorder=0)
-
-    y0 = np.ma.masked_less_equal(y[0, 0], 0.0)
-    heat = ax.imshow(y0, cmap="hot", vmin=0.0, vmax=vmax,
-                     interpolation="nearest", zorder=1)
-    scat = ax.scatter(positions[0, :, 0], positions[0, :, 1],
-                      s=6, c="cyan", edgecolors="black", linewidths=0.3, zorder=2)
-    txt = ax.text(0.01, 0.99, "", transform=ax.transAxes, va="top", ha="left",
-                  color="white", fontsize=8,
-                  bbox=dict(facecolor="black", alpha=0.4, pad=2), zorder=3)
-
-    n_agents = positions.shape[1]
-    writer = FFMpegWriter(fps=fps, codec="libx264",
-                          metadata={"title": npz_path.stem},
-                          extra_args=["-pix_fmt", "yuv420p"])
-    with writer.saving(fig, str(out_path), dpi=dpi):
-        for t in range(0, T, stride):
-            heat.set_data(np.ma.masked_less_equal(y[t, 0], 0.0))
-            scat.set_offsets(positions[t])
-            txt.set_text(f"{npz_path.stem}  t={t}/{T - 1}  agents={n_agents}")
-            writer.grab_frame()
-    plt.close(fig)
+    vmax = render_congestion_video(
+        y, positions, obstacle, out_path,
+        fps=fps, stride=stride, dpi=dpi, vmax=vmax_fixed, vmax_pct=vmax_pct,
+        title_fmt=f"{npz_path.stem}  t={{t}}/{{T}}  agents={{agents}}")
     data.close()
     return f"ok   {out_path.name}  (vmax={vmax:.0f}, frames={len(range(0, T, stride))})"
 

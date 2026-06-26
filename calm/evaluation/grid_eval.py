@@ -223,6 +223,31 @@ def _hstack(left_mp4, right_mp4, out_mp4, cq=15):
         subprocess.run(base + x264, check=True)
 
 
+def _heatmap_pair(env, ap_base, ap_cong, cfg, out_mp4, tmp, args, labels):
+    """Render the GROUND-TRUTH congestion fields of the vanilla and congestion-aware
+    runs as 'hot' heatmaps and hstack them (vanilla | congestion) -> out_mp4 -- the same
+    side-by-side layout as the movement video, but of the congestion the AMRs actually
+    produced. A shared colour scale (percentile over BOTH fields) makes the two panels
+    directly comparable, so you can see the applied run flatten the hotspots."""
+    from calm.generate_heatmap.render_heatmap import render_congestion_video
+    walk = np.asarray(env["walkable_map"]).astype(bool)
+    H, W = walk.shape[:2]
+    obstacle = np.asarray(env.get("obstacle_map", (~walk).astype(np.uint8)), dtype=np.float32)
+    cv, sv = cfg.congestion_center_value, cfg.congestion_step_value
+    cong_b = mapf.build_additive_congestion_label_sequence(ap_base, H, W, cv, sv)
+    cong_c = mapf.build_additive_congestion_label_sequence(ap_cong, H, W, cv, sv)
+    both = np.concatenate([cong_b[cong_b > 0].ravel(), cong_c[cong_c > 0].ravel()])
+    vmax = float(np.percentile(both, args.heatmap_vmax_pct)) if both.size else 1.0
+    fps = max(1, round(30 / max(1, args.anim_subframes)))    # match the movement clip's duration
+    lb, lc = labels
+    bmp4, cmp4 = tmp / "heat_vanilla.mp4", tmp / "heat_cong.mp4"
+    render_congestion_video(cong_b, ap_base, obstacle, bmp4, fps=fps, dpi=args.video_dpi,
+                            vmax=vmax, label=lb, title_fmt="t={t}/{T}")
+    render_congestion_video(cong_c, ap_cong, obstacle, cmp4, fps=fps, dpi=args.video_dpi,
+                            vmax=vmax, label=lc, title_fmt="t={t}/{T}")
+    _hstack(bmp4, cmp4, out_mp4, args.video_cq)
+
+
 # ---------------------------------------------------------------------------
 # work unit = ONE planner run (a single grid point), so every worker stays busy:
 # the total run count vastly outnumbers the workers. env / base config are
@@ -313,6 +338,7 @@ def video_job(vjob, args, out_dir_str):
         gamma=next(iter(best_by_gamma)), horizon=horizon, min_depth=prim_md, depth_mode=prim_mode)
     vanilla_mp4 = _animate_scenario(env, starts, clip(base_paths), base_summary,
                                     anim_cfg, tmp / "vanilla.mp4", tmp / "v")
+    ap_base = mapf.paths_to_agent_positions(base_paths, vs) if args.heatmap else None
     names = []
     for g in sorted(best_by_gamma):
         w = best_by_gamma[g]
@@ -324,6 +350,13 @@ def video_job(vjob, args, out_dir_str):
                 f"{prim_mode}_md{prim_md}_g{g:g}_w{w:g}.mp4")
         _hstack(vanilla_mp4, cong_mp4, vdir / name, args.video_cq)
         names.append(name)
+        if args.heatmap:
+            ap_cong = mapf.paths_to_agent_positions(cpaths, vs)
+            hname = name[:-4] + "_heatmap.mp4"
+            _heatmap_pair(env, ap_base, ap_cong, cfg, vdir / hname, tmp, args,
+                          labels=("vanilla λ0",
+                                  f"{prim_mode} md{prim_md} g{g:g} λ{w:g}"))
+            names.append(hname)
     shutil.rmtree(tmp, ignore_errors=True)
     return {"cell_idx": vjob["cell_idx"], "videos": names}
 
@@ -538,6 +571,14 @@ def parse_args():
     ap.add_argument("--planned-routes", action="store_true",
                     help="also draw each robot's full planned route as a faint underlay "
                          "(off by default: 300-750 such polylines clutter the frame).")
+    ap.add_argument("--heatmap", action="store_true",
+                    help="also render a SEPARATE congestion-heatmap MP4 per gamma: the ground-truth "
+                         "congestion fields of the vanilla vs congestion-aware runs side by side "
+                         "(same vanilla|applied layout as the movement video, shared colour scale). "
+                         "Reuses each run's paths -- no extra solves, just extra rendering.")
+    ap.add_argument("--heatmap-vmax-pct", type=float, default=99.0,
+                    help="percentile of positive congestion used as the shared heatmap colour-scale "
+                         "max across BOTH panels (lower = brighter / more saturated).")
     ap.add_argument("--verbose", action="store_true",
                     help="scrolling per-cell/per-video log instead of the tqdm progress bar")
     args = ap.parse_args()
