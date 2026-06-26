@@ -51,10 +51,11 @@ def plot_map_background(
             code = int(raw_code)
             color = colors.get(code, "#f2f2f2")
             background[factory_map == code] = to_rgb(color)
-        ax.imshow(background, origin="upper")
+        ax.imshow(background, origin="upper", interpolation="nearest")
     else:
         background = np.where(walkable_map, 1.0, 0.15)
-        ax.imshow(background, cmap="gray", origin="upper", vmin=0.0, vmax=1.0)
+        ax.imshow(background, cmap="gray", origin="upper", vmin=0.0, vmax=1.0,
+                  interpolation="nearest")
     ax.set_xlim(-0.5, w - 0.5)
     ax.set_ylim(h - 0.5, -0.5)
     ax.set_xticks(np.arange(-0.5, w, 1), minor=True)
