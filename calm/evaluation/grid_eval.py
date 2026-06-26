@@ -223,29 +223,63 @@ def _hstack(left_mp4, right_mp4, out_mp4, cq=15):
         subprocess.run(base + x264, check=True)
 
 
-def _heatmap_pair(env, ap_base, ap_cong, cfg, out_mp4, tmp, args, labels):
-    """Render the GROUND-TRUTH congestion fields of the vanilla and congestion-aware
-    runs as 'hot' heatmaps and hstack them (vanilla | congestion) -> out_mp4 -- the same
-    side-by-side layout as the movement video, but of the congestion the AMRs actually
-    produced. A shared colour scale (percentile over BOTH fields) makes the two panels
-    directly comparable, so you can see the applied run flatten the hotspots."""
-    from calm.generate_heatmap.render_heatmap import render_congestion_video
-    walk = np.asarray(env["walkable_map"]).astype(bool)
-    H, W = walk.shape[:2]
-    obstacle = np.asarray(env.get("obstacle_map", (~walk).astype(np.uint8)), dtype=np.float32)
-    cv, sv = cfg.congestion_center_value, cfg.congestion_step_value
-    cong_b = mapf.build_additive_congestion_label_sequence(ap_base, H, W, cv, sv)
-    cong_c = mapf.build_additive_congestion_label_sequence(ap_cong, H, W, cv, sv)
-    both = np.concatenate([cong_b[cong_b > 0].ravel(), cong_c[cong_c > 0].ravel()])
-    vmax = float(np.percentile(both, args.heatmap_vmax_pct)) if both.size else 1.0
-    fps = max(1, round(30 / max(1, args.anim_subframes)))    # match the movement clip's duration
-    lb, lc = labels
-    bmp4, cmp4 = tmp / "heat_vanilla.mp4", tmp / "heat_cong.mp4"
-    render_congestion_video(cong_b, ap_base, obstacle, bmp4, fps=fps, dpi=args.video_dpi,
-                            vmax=vmax, label=lb, title_fmt="t={t}/{T}")
-    render_congestion_video(cong_c, ap_cong, obstacle, cmp4, fps=fps, dpi=args.video_dpi,
-                            vmax=vmax, label=lc, title_fmt="t={t}/{T}")
-    _hstack(bmp4, cmp4, out_mp4, args.video_cq)
+def _predict_congestion_sequence(cong, predictor, predict_every, *, chunk=64):
+    """Replay the SimVP predictor over a trajectory's per-step congestion to get the
+    predicted-congestion FIELD the planner would consult at each step -- usable for the
+    vanilla run too (the predictor never ran during vanilla planning, but we can still
+    show what it WOULD have forecast).
+
+    ``cong`` is (T,H,W) raw instantaneous congestion. The predictor is re-run every
+    ``predict_every`` steps on the trailing 10 frames (the planner's cadence); the first
+    9 steps have no 10-frame history yet, so they stay zero. Predictions are batched.
+    Returns (T,H,W) raw predicted congestion."""
+    cong = np.asarray(cong, np.float32)
+    T = cong.shape[0]
+    out = np.zeros_like(cong)
+    if T < 10:
+        return out
+    step = max(1, int(predict_every))
+    bases = list(range(9, T, step))                       # each base sees frames base-9..base
+    futs = []
+    for s in range(0, len(bases), chunk):                 # batch to bound GPU memory
+        pasts = np.stack([cong[b - 9:b + 1] for b in bases[s:s + chunk]])[:, :, None]  # (B,10,1,H,W)
+        futs.append(np.asarray(predictor.predict(pasts))[:, :, 0])                      # (B,10,H,W)
+    fut = np.concatenate(futs, axis=0)
+    for i, b in enumerate(bases):
+        nb = bases[i + 1] if i + 1 < len(bases) else T
+        for t in range(b, nb):
+            out[t] = fut[i, min(t - b, 9)]                # forecast for this step from base b
+    return out
+
+
+def _xstack_grid(panels, out_mp4, *, cols, rows, cell_w, cell_h, cq=15):
+    """Tile equal-cell MP4s into a cols x rows grid (ffmpeg xstack). Each input is fps-
+    synced and letterboxed into a cell_w x cell_h cell (no distortion), so panels of
+    different native aspect (movement 10x8 vs heatmap 8x5) line up. `panels` is row-major.
+    Re-encodes on the GPU (NVENC), falling back to CPU x264."""
+    import subprocess
+    import imageio_ffmpeg
+    ff = imageio_ffmpeg.get_ffmpeg_exe()
+    ins = []
+    for p in panels:
+        ins += ["-i", str(p)]
+    pre = [
+        f"[{i}:v]fps=30,scale={cell_w}:{cell_h}:force_original_aspect_ratio=decrease,"
+        f"pad={cell_w}:{cell_h}:({cell_w}-iw)/2:({cell_h}-ih)/2:color=black,setsar=1[v{i}]"
+        for i in range(len(panels))
+    ]
+    layout = "|".join(f"{(i % cols) * cell_w}_{(i // cols) * cell_h}" for i in range(len(panels)))
+    chain = (";".join(pre) + ";" + "".join(f"[v{i}]" for i in range(len(panels)))
+             + f"xstack=inputs={len(panels)}:layout={layout}[v]")
+    base = [ff, "-y", "-loglevel", "error", *ins, "-filter_complex", chain, "-map", "[v]"]
+    nvenc = ["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-rc", "vbr",
+             "-cq", str(cq), "-b:v", "0", "-pix_fmt", "yuv420p", str(out_mp4)]
+    x264 = ["-c:v", "libx264", "-preset", "slow", "-crf", str(cq + 1),
+            "-pix_fmt", "yuv420p", str(out_mp4)]
+    try:
+        subprocess.run(base + nvenc, check=True)
+    except subprocess.CalledProcessError:
+        subprocess.run(base + x264, check=True)
 
 
 # ---------------------------------------------------------------------------
@@ -318,10 +352,17 @@ def run_job(job, args):
 
 
 def video_job(vjob, args, out_dir_str):
-    """Render one vanilla|congestion MP4 per gamma for a cell (primary config, best lambda).
+    """Render one MP4 per gamma for a cell (primary config, best lambda). Default is a
+    cols x rows composite per gamma -- row 1 vanilla, row 2 the congestion-aware run;
+    col 1 movement, col 2 the ACTUAL congestion field the AMRs produced, col 3 the
+    SimVP-PREDICTED field (replayed post-hoc, so the vanilla run gets one too). With
+    --movement-only it falls back to the plain vanilla|congestion movement clip.
     Re-runs the baseline + each chosen config deterministically, so no paths are shipped."""
+    from calm.generate_heatmap.render_heatmap import render_congestion_video
     env = get_env()
     walkable = np.asarray(env["walkable_map"]).astype(bool)
+    H, W = walkable.shape[:2]
+    obstacle = np.asarray(env.get("obstacle_map", (~walkable).astype(np.uint8)), dtype=np.float32)
     cfg = _cell_cfg(vjob["count"], vjob["frac"], vjob["seed"], args)
     starts, _ = mapf.select_start_goal_pairs(env, walkable, cfg)
     prim_mode, prim_md, horizon = vjob["prim_mode"], vjob["prim_md"], vjob["horizon"]
@@ -332,31 +373,74 @@ def video_job(vjob, args, out_dir_str):
     anim_cfg = _anim_config(cfg, args)
     vs = args.video_seconds if 0 < args.video_seconds < args.seconds else (args.seconds + 1)
     clip = lambda paths: [p[:vs + 1] for p in paths]
+    cv, sv = cfg.congestion_center_value, cfg.congestion_step_value
+    composite = not args.movement_only
+    predictor = get_predictor() if composite else None
+    name_for = lambda g, w: (f"ep{vjob['cell_idx']:03d}_n{vjob['count']}_f{vjob['frac']:.1f}_"
+                             f"{prim_mode}_md{prim_md}_g{g:g}_w{w:g}.mp4")
 
+    # vanilla (lambda 0) -- shared across every gamma in this cell
     base_paths, base_summary, _ = solve(
         0.0, env, cfg, starts, args.predict_every,
         gamma=next(iter(best_by_gamma)), horizon=horizon, min_depth=prim_md, depth_mode=prim_mode)
-    vanilla_mp4 = _animate_scenario(env, starts, clip(base_paths), base_summary,
-                                    anim_cfg, tmp / "vanilla.mp4", tmp / "v")
-    ap_base = mapf.paths_to_agent_positions(base_paths, vs) if args.heatmap else None
-    names = []
+    van_move = _animate_scenario(env, starts, clip(base_paths), base_summary,
+                                 anim_cfg, tmp / "van_move.mp4", tmp / "vm")
+    ap_base = mapf.paths_to_agent_positions(base_paths, vs)
+    van_act = van_pred = None
+    if composite:
+        van_act = mapf.build_additive_congestion_label_sequence(ap_base, H, W, cv, sv)
+        van_pred = _predict_congestion_sequence(van_act, predictor, args.predict_every)
+
+    # each gamma's congestion-aware run (movement now; fields kept for a shared colour scale)
+    runs = []
     for g in sorted(best_by_gamma):
         w = best_by_gamma[g]
         cpaths, csumm, _ = solve(w, env, cfg, starts, args.predict_every,
                                  gamma=g, horizon=horizon, min_depth=prim_md, depth_mode=prim_mode)
-        cong_mp4 = _animate_scenario(env, starts, clip(cpaths), csumm, anim_cfg,
-                                     tmp / f"g{g:g}.mp4", tmp / f"c{g:g}")
-        name = (f"ep{vjob['cell_idx']:03d}_n{vjob['count']}_f{vjob['frac']:.1f}_"
-                f"{prim_mode}_md{prim_md}_g{g:g}_w{w:g}.mp4")
-        _hstack(vanilla_mp4, cong_mp4, vdir / name, args.video_cq)
-        names.append(name)
-        if args.heatmap:
-            ap_cong = mapf.paths_to_agent_positions(cpaths, vs)
-            hname = name[:-4] + "_heatmap.mp4"
-            _heatmap_pair(env, ap_base, ap_cong, cfg, vdir / hname, tmp, args,
-                          labels=("vanilla λ0",
-                                  f"{prim_mode} md{prim_md} g{g:g} λ{w:g}"))
-            names.append(hname)
+        app_move = _animate_scenario(env, starts, clip(cpaths), csumm, anim_cfg,
+                                     tmp / f"app_move_g{g:g}.mp4", tmp / f"am{g:g}")
+        d = {"g": g, "w": w, "move": app_move}
+        if composite:
+            d["ap"] = mapf.paths_to_agent_positions(cpaths, vs)
+            d["act"] = mapf.build_additive_congestion_label_sequence(d["ap"], H, W, cv, sv)
+            d["pred"] = _predict_congestion_sequence(d["act"], predictor, args.predict_every)
+        runs.append(d)
+
+    names = []
+    if not composite:                                   # plain vanilla|congestion movement clip
+        for d in runs:
+            name = name_for(d["g"], d["w"])
+            _hstack(van_move, d["move"], vdir / name, args.video_cq)
+            names.append(name)
+        shutil.rmtree(tmp, ignore_errors=True)
+        return {"cell_idx": vjob["cell_idx"], "videos": names}
+
+    # one colour scale across ALL heatmap fields in the cell, so every panel is comparable
+    fields = [van_act, van_pred] + [d["act"] for d in runs] + [d["pred"] for d in runs]
+    cat = np.concatenate([f[f > 0].ravel() for f in fields])
+    vmax = float(np.percentile(cat, args.heatmap_vmax_pct)) if cat.size else 1.0
+    hfps = max(1, round(30 / max(1, args.anim_subframes)))   # match the movement clip's duration
+    hm = lambda field, ap, out, label: render_congestion_video(
+        field, ap, obstacle, out, fps=hfps, dpi=args.video_dpi, vmax=vmax,
+        label=label, title_fmt="t={t}/{T}")
+
+    van_act_mp4, van_pred_mp4 = tmp / "van_act.mp4", tmp / "van_pred.mp4"
+    hm(van_act, ap_base, van_act_mp4, "vanilla λ0  actual")
+    hm(van_pred, ap_base, van_pred_mp4, "vanilla λ0  predicted")
+    cols, rows = (2, 3) if args.video_grid == "2x3" else (3, 2)
+    for d in runs:
+        g, w = d["g"], d["w"]
+        lab = f"{prim_mode} md{prim_md} g{g:g} λ{w:g}"
+        app_act_mp4, app_pred_mp4 = tmp / f"app_act_g{g:g}.mp4", tmp / f"app_pred_g{g:g}.mp4"
+        hm(d["act"], d["ap"], app_act_mp4, lab + "  actual")
+        hm(d["pred"], d["ap"], app_pred_mp4, lab + "  predicted")
+        if cols == 2:                                   # 2 cols x 3 rows: col=condition, row=view
+            panels = [van_move, d["move"], van_act_mp4, app_act_mp4, van_pred_mp4, app_pred_mp4]
+        else:                                           # 3 cols x 2 rows: row=condition, col=view
+            panels = [van_move, van_act_mp4, van_pred_mp4, d["move"], app_act_mp4, app_pred_mp4]
+        _xstack_grid(panels, vdir / name_for(g, w), cols=cols, rows=rows,
+                     cell_w=800, cell_h=500, cq=args.video_cq)
+        names.append(name_for(g, w))
     shutil.rmtree(tmp, ignore_errors=True)
     return {"cell_idx": vjob["cell_idx"], "videos": names}
 
@@ -571,14 +655,18 @@ def parse_args():
     ap.add_argument("--planned-routes", action="store_true",
                     help="also draw each robot's full planned route as a faint underlay "
                          "(off by default: 300-750 such polylines clutter the frame).")
-    ap.add_argument("--heatmap", action="store_true",
-                    help="also render a SEPARATE congestion-heatmap MP4 per gamma: the ground-truth "
-                         "congestion fields of the vanilla vs congestion-aware runs side by side "
-                         "(same vanilla|applied layout as the movement video, shared colour scale). "
-                         "Reuses each run's paths -- no extra solves, just extra rendering.")
+    ap.add_argument("--movement-only", action="store_true",
+                    help="render the plain vanilla|congestion MOVEMENT clip only (the old default). "
+                         "Without this each gamma gets the full composite: row 1 vanilla / row 2 "
+                         "congestion-aware, col 1 movement / col 2 actual congestion / col 3 "
+                         "SimVP-predicted congestion. The composite needs the GPU predictor.")
+    ap.add_argument("--video-grid", choices=("3x2", "2x3"), default="3x2",
+                    help="composite tiling: 3x2 = cols are movement|actual|predicted, rows are "
+                         "vanilla/applied (wide); 2x3 = cols are vanilla|applied, rows are the three "
+                         "views (near-square, keeps the old left-right vanilla|applied split).")
     ap.add_argument("--heatmap-vmax-pct", type=float, default=99.0,
                     help="percentile of positive congestion used as the shared heatmap colour-scale "
-                         "max across BOTH panels (lower = brighter / more saturated).")
+                         "max across ALL panels in a composite (lower = brighter / more saturated).")
     ap.add_argument("--verbose", action="store_true",
                     help="scrolling per-cell/per-video log instead of the tqdm progress bar")
     args = ap.parse_args()
