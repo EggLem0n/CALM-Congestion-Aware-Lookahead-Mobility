@@ -586,10 +586,26 @@ def animate_paths(
 
     anim = FuncAnimation(fig, update, frames=total_frames, interval=config.animation_interval_ms, blit=False)
     fps = 30  # fixed playback frame rate
-    # Prefer MP4 (h264) -- far smaller than GIF for long, many-agent runs. Fall back
-    # to GIF when ffmpeg is unavailable (e.g. a fresh clone without ffmpeg on PATH).
+    dpi = int(getattr(config, "viz_video_dpi", 200))    # figsize (10,8) -> dpi 200 = 2000x1600 px
+    cq = int(getattr(config, "viz_video_cq", 15))       # NVENC constant quality (lower = better)
+    # Encode on the GPU (NVENC H.264) at high quality; fall back to high-quality CPU x264, then
+    # GIF -- so a box without an NVIDIA GPU (or a fresh clone without ffmpeg) still produces output.
+    # Quality (vs the old fixed 2400 kbps libx264) comes from CQ-based rate control + the higher dpi.
+    mp4 = output_dir / "classical_mapf_animation.mp4"
+    encoders = [
+        ("h264_nvenc", ["-preset", "p7", "-tune", "hq", "-rc", "vbr",
+                        "-cq", str(cq), "-b:v", "0", "-pix_fmt", "yuv420p"]),
+        ("libx264", ["-preset", "slow", "-crf", str(cq + 1), "-pix_fmt", "yuv420p"]),
+    ]
     if FFMpegWriter.isAvailable():
-        anim.save(output_dir / "classical_mapf_animation.mp4", writer=FFMpegWriter(fps=fps, bitrate=2400))
+        for codec, extra in encoders:
+            try:
+                anim.save(mp4, writer=FFMpegWriter(fps=fps, codec=codec, extra_args=extra), dpi=dpi)
+                break
+            except Exception:                            # encoder unavailable -> try the next one
+                continue
+        else:
+            anim.save(output_dir / "classical_mapf_animation.gif", writer=PillowWriter(fps=fps), dpi=dpi)
     else:
-        anim.save(output_dir / "classical_mapf_animation.gif", writer=PillowWriter(fps=fps))
+        anim.save(output_dir / "classical_mapf_animation.gif", writer=PillowWriter(fps=fps), dpi=dpi)
     plt.close(fig)

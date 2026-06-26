@@ -184,6 +184,8 @@ def _anim_config(base, args):
         viz_planned_route_linewidth=args.planned_route_linewidth,
         viz_target_size=args.target_size,
         show_planning_progress=False,
+        viz_video_dpi=args.video_dpi,
+        viz_video_cq=args.video_cq,
     )
 
 
@@ -202,17 +204,23 @@ def _animate_scenario(env, starts, paths, summary, anim_cfg, out_mp4, tmp_dir):
     return out_mp4
 
 
-def _hstack(left_mp4, right_mp4, out_mp4):
-    """Combine two equal-size clips side by side (ffmpeg hstack)."""
+def _hstack(left_mp4, right_mp4, out_mp4, cq=15):
+    """Combine two equal-size clips side by side (ffmpeg hstack). Re-encodes on the GPU
+    (NVENC H.264) at high quality so this second pass barely adds generation loss; falls
+    back to high-quality CPU x264 if NVENC is unavailable on this machine."""
     import subprocess
     import imageio_ffmpeg
     ff = imageio_ffmpeg.get_ffmpeg_exe()
-    subprocess.run(
-        [ff, "-y", "-loglevel", "error", "-i", str(left_mp4), "-i", str(right_mp4),
-         "-filter_complex", "[0:v][1:v]hstack=inputs=2",
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out_mp4)],
-        check=True,
-    )
+    base = [ff, "-y", "-loglevel", "error", "-i", str(left_mp4), "-i", str(right_mp4),
+            "-filter_complex", "[0:v][1:v]hstack=inputs=2"]
+    nvenc = ["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-rc", "vbr",
+             "-cq", str(cq), "-b:v", "0", "-pix_fmt", "yuv420p", str(out_mp4)]
+    x264 = ["-c:v", "libx264", "-preset", "slow", "-crf", str(cq + 1),
+            "-pix_fmt", "yuv420p", str(out_mp4)]
+    try:
+        subprocess.run(base + nvenc, check=True)
+    except subprocess.CalledProcessError:
+        subprocess.run(base + x264, check=True)
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +322,7 @@ def video_job(vjob, args, out_dir_str):
                                      tmp / f"g{g:g}.mp4", tmp / f"c{g:g}")
         name = (f"ep{vjob['cell_idx']:03d}_n{vjob['count']}_f{vjob['frac']:.1f}_"
                 f"{prim_mode}_md{prim_md}_g{g:g}_w{w:g}.mp4")
-        _hstack(vanilla_mp4, cong_mp4, vdir / name)
+        _hstack(vanilla_mp4, cong_mp4, vdir / name, args.video_cq)
         names.append(name)
     shutil.rmtree(tmp, ignore_errors=True)
     return {"cell_idx": vjob["cell_idx"], "videos": names}
@@ -476,6 +484,15 @@ def parse_args():
     ap.add_argument("--planned-route-linewidth", type=float, default=0.3,
                     help="faint full planned-route underlay width (only if --planned-routes).")
     ap.add_argument("--target-size", type=float, default=40.0, help="pickup/delivery target marker area.")
+    ap.add_argument("--video-dpi", type=int, default=200,
+                    help="MP4 render resolution: the figure is 10x8 in, so dpi 200 -> 2000x1600 px "
+                         "(the old default was effectively 100 = 1000x800). Higher = crisper dots but "
+                         "slower to render and larger files.")
+    ap.add_argument("--video-cq", type=int, default=15,
+                    help="NVENC constant-quality level (0-51, lower = higher quality / larger file). "
+                         "15 is near-visually-lossless for this flat dots-on-map content; push to ~10 for "
+                         "max quality. The CPU x264 fallback uses crf = cq + 1. Encoding is on the GPU "
+                         "(h264_nvenc); both the per-panel render and the side-by-side hstack use it.")
     ap.add_argument("--planned-routes", action="store_true",
                     help="also draw each robot's full planned route as a faint underlay "
                          "(off by default: 300-750 such polylines clutter the frame).")
