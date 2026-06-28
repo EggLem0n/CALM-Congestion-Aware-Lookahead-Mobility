@@ -31,7 +31,7 @@ calm/
   evaluation/                 # PIBT 혼잡회피 평가·비교 (예측기를 import)
     grid_eval.py                  혼잡적용 PIBT vs vanilla 비교 그리드 (+ 영상)
     ab_eval.py                    A/B 평가 (콘솔)
-    make_metrics_table.py         metrics.csv -> 표 PNG
+    make_analysis_summary.py      metrics.csv -> analysis_summary.md (런마다 자동, 단독 재생성 가능)
 ```
 
 ## 셋업 & 실행
@@ -70,8 +70,9 @@ python visualize.py                     # 학습 결과 그림
 ```bash
 cd calm/evaluation
 python grid_eval.py                     # 혼잡적용 vs vanilla 비교 그리드 (+ 영상)
+python grid_eval.py --video-only --from-run reports/CALM_comparison/<타임스탬프>   # 영상만 재인코딩(재시뮬 없음)
 python ab_eval.py                       # A/B 평가 (콘솔)
-python make_metrics_table.py            # metrics.csv -> 표 PNG
+python make_analysis_summary.py reports/CALM_comparison/<타임스탬프>   # csv -> analysis_summary.md 재생성
 ```
 
 ## 출력(`reports/`) 분류
