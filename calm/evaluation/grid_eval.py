@@ -409,12 +409,14 @@ def run_job(job, args, out_dir_str=None):
         if job["baseline"]:
             row = {"episode": job["cell_idx"], "num_agents": job["count"], "frac": job["frac"],
                    "gamma": "", "horizon": job["horizon"], "min_depth": "", "depth_mode": "baseline",
-                   "weight": 0.0, "predict_every": "", "cap": "", "seed": job["seed"], **m}
+                   "weight": 0.0, "predict_every": "", "cap": "", "seed": job["seed"],
+                   "rep": job["rep"], **m}
         else:
             row = {"episode": job["cell_idx"], "num_agents": job["count"], "frac": job["frac"],
                    "gamma": job["gamma"], "horizon": job["horizon"], "min_depth": job["min_depth"],
                    "depth_mode": job["depth_mode"], "weight": job["weight"],
-                   "predict_every": job["predict_every"], "cap": job["cap"], "seed": job["seed"], **m}
+                   "predict_every": job["predict_every"], "cap": job["cap"], "seed": job["seed"],
+                   "rep": job["rep"], **m}
         return {"cell_idx": job["cell_idx"], "row": row}
     finally:
         if _RUNNING is not None:
@@ -541,7 +543,8 @@ def _build_vjobs(cells, rows_by_cell, gammas, prim, completed):
         best_by_gamma = {}
         for g in gammas:
             cand = [r for r in rows_by_cell.get(ci, [])
-                    if r["depth_mode"] == prim["mode"] and r["min_depth"] == prim["md"]
+                    if r.get("rep", 0) == 0                       # videos render rep 0 only
+                    and r["depth_mode"] == prim["mode"] and r["min_depth"] == prim["md"]
                     and r["gamma"] == g and r["predict_every"] == prim["pe"]
                     and r["horizon"] == prim["h"] and r["cap"] == prim["cap"]]
             if cand:
@@ -777,6 +780,13 @@ def parse_args():
                     help="Parallel cell jobs. NOTE: lambda>0 runs use the GPU; many processes "
                          "share one GPU (each loads the 220MB model). Raise only if VRAM allows.")
     ap.add_argument("--base-seed", type=int, default=42, help="cell i uses base_seed + i (shared across lambdas).")
+    ap.add_argument("--repeats", type=int, default=1,
+                    help="repeat the WHOLE grid across this many distinct seeds (default 1 = old "
+                         "behaviour). Repeat r of cell i uses seed base_seed + r*cells + i, so rep 0 "
+                         "reproduces the single-seed run exactly and extra reps add seed diversity. "
+                         "Within one (cell, rep) the seed is still shared across lambdas, so each "
+                         "repeat stays a controlled A/B. Every metric table then averages over seeds "
+                         "and the +-sd column shows the across-seed spread. Videos use rep 0 only.")
     ap.add_argument("--seconds", type=int, default=900,
                     help="episode length in steps (metrics use the full length; dataset used 1800).")
     ap.add_argument("--video-seconds", type=int, default=900,
@@ -887,6 +897,8 @@ def parse_args():
         ap.error("require 1 <= --min-agents <= --max-agents")
     if not (0.0 <= args.min_frac <= args.max_frac <= 1.0):
         ap.error("require 0.0 <= --min-frac <= --max-frac <= 1.0")
+    if args.repeats < 1:
+        ap.error("require --repeats >= 1")
     return args
 
 
@@ -909,6 +921,7 @@ def _typed_metric_rows(csv_path):
                 "weight": float(r["weight"]) if r["weight"] not in ("", None) else 0.0,
                 "predict_every": num(r["predict_every"], int),
                 "cap": num(r["cap"], float),
+                "rep": int(r["rep"]) if r.get("rep") not in ("", None) else 0,  # absent in pre-repeats CSVs
                 "deliveries": float(r["deliveries"]) if r["deliveries"] not in ("", None) else 0.0,
             })
     return rows
@@ -990,6 +1003,7 @@ def main():
     horizons = sorted({max(1, min(10, int(h))) for h in (args.horizons or [args.horizon])})
     # congestion_max_penalty (clip) sweep axis: explicit --caps, else a single 0 (off). Clamp >= 0.
     caps = sorted({max(0.0, float(c)) for c in (args.caps or [0.0])})
+    n_repeats = max(1, int(args.repeats))   # run every condition across this many distinct seeds
     counts, fracs = agent_count_sweep(args), frac_sweep(args)
     grid = grid_cells(args)
     weights = sorted(args.weights)
@@ -1006,11 +1020,14 @@ def main():
     cong_per_cell = (len(depth_modes) * len(min_depths) * len(gammas) * len(horizons)
                      * len(weights_pos) * len(predict_everys) * len(caps))
     runs_per_cell = 1 + cong_per_cell
+    board_runs_per_cell = runs_per_cell * n_repeats   # a (count,frac) cell holds every config across all seeds
     n_vid = 0 if (args.no_video or not weights_pos) else len(grid) * len(gammas)
     print(f"grid: counts {counts} x fracs {fracs} | lambdas {weights} x gammas {gammas} "
           f"| min_depths {min_depths} x depth_modes {depth_modes} | horizons {horizons} "
-          f"| predict_everys {predict_everys} | caps {caps}")
-    print(f"  = {len(grid)} cells x {runs_per_cell} runs = {len(grid) * runs_per_cell} planner runs"
+          f"| predict_everys {predict_everys} | caps {caps} | repeats {n_repeats}")
+    seeds_note = f" x {n_repeats} seeds" if n_repeats > 1 else ""
+    print(f"  = {len(grid)} cells x {runs_per_cell} runs{seeds_note} = "
+          f"{len(grid) * board_runs_per_cell} planner runs"
           f"{'' if args.no_video else f'  (+{n_vid} MP4s: vanilla vs best-lambda per gamma)'}", flush=True)
     print(f"output -> {out_dir}\n", flush=True)
 
@@ -1023,7 +1040,7 @@ def main():
     # (and the per-cell MP4s are likewise already on disk).
     csv_path = out_dir / "metrics.csv"
     csv_fields = ["episode", "num_agents", "frac", "gamma", "horizon", "min_depth", "depth_mode",
-                  "weight", "predict_every", "cap", "seed", "deliveries", "energy", "energy_per_delivery",
+                  "weight", "predict_every", "cap", "seed", "rep", "deliveries", "energy", "energy_per_delivery",
                   "density_uniformity", "occ_cv", "mean_robot_cong", "p99_cong", "peak_cong",
                   "collisions", "preds", "wall_s"]
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
@@ -1043,24 +1060,31 @@ def main():
     prim0 = (depth_modes[0], min_depths[0], predict_everys[0], horizons[0], caps[0])
     per_cell_jobs = []
     for ci, (count, frac) in enumerate(grid):
-        seed = args.base_seed + ci               # per-cell seed, shared by that cell's runs (A/B)
-        jl = [{"cell_idx": ci, "count": count, "frac": frac, "seed": seed, "baseline": True,
-               "weight": 0.0, "gamma": gammas[0], "horizon": horizons[0],
-               "min_depth": min_depths[0], "depth_mode": depth_modes[0],
-               "predict_every": predict_everys[0], "cap": caps[0], "save_paths": videos_on}]
-        for mode in depth_modes:
-            for md in min_depths:
-                for g in gammas:
-                    for h in horizons:
-                        for w in weights_pos:
-                            for pe in predict_everys:
-                                for cap in caps:
-                                    is_prim = (mode, md, pe, h, cap) == prim0
-                                    jl.append({"cell_idx": ci, "count": count, "frac": frac,
-                                               "seed": seed, "baseline": False, "weight": w,
-                                               "gamma": g, "horizon": h, "min_depth": md,
-                                               "depth_mode": mode, "predict_every": pe, "cap": cap,
-                                               "save_paths": videos_on and is_prim})
+        jl = []
+        for rep in range(n_repeats):
+            # rep 0 reuses the original per-cell seed (base_seed + ci); each extra rep shifts by a
+            # whole grid so every (cell, rep) gets a distinct seed. The seed is shared by all configs
+            # within one (cell, rep), so each repeat stays a controlled A/B (only lambda/config varies).
+            seed = args.base_seed + rep * total + ci
+            save0 = videos_on and rep == 0       # only the representative seed feeds the video cache
+            jl.append({"cell_idx": ci, "count": count, "frac": frac, "seed": seed, "rep": rep,
+                       "baseline": True, "weight": 0.0, "gamma": gammas[0], "horizon": horizons[0],
+                       "min_depth": min_depths[0], "depth_mode": depth_modes[0],
+                       "predict_every": predict_everys[0], "cap": caps[0], "save_paths": save0})
+            for mode in depth_modes:
+                for md in min_depths:
+                    for g in gammas:
+                        for h in horizons:
+                            for w in weights_pos:
+                                for pe in predict_everys:
+                                    for cap in caps:
+                                        is_prim = (mode, md, pe, h, cap) == prim0
+                                        jl.append({"cell_idx": ci, "count": count, "frac": frac,
+                                                   "seed": seed, "rep": rep, "baseline": False,
+                                                   "weight": w, "gamma": g, "horizon": h,
+                                                   "min_depth": md, "depth_mode": mode,
+                                                   "predict_every": pe, "cap": cap,
+                                                   "save_paths": save0 and is_prim})
         per_cell_jobs.append(jl)
     jobs = [j for wave in zip_longest(*per_cell_jobs) for j in wave if j is not None]
     total_runs = len(jobs)
@@ -1103,10 +1127,10 @@ def main():
             csv.DictWriter(fh, fieldnames=csv_fields).writerow(row)
         cell_done[ci] += 1
         counter.value += 1
-        if cell_done[ci] >= runs_per_cell:
-            status[ci] = 2                   # all of this cell's runs done -> check mark
+        if cell_done[ci] >= board_runs_per_cell:
+            status[ci] = 2                   # all of this cell's runs (every seed) done -> check mark
             if board is None:
-                nd = sum(1 for d in cell_done if d >= runs_per_cell)
+                nd = sum(1 for d in cell_done if d >= board_runs_per_cell)
                 el = time.perf_counter() - t0
                 print(f"[{nd:>2}/{total}] cell {ci} ({row['num_agents']} AMRs frac {row['frac']:.1f}) "
                       f"done | {counter.value}/{total_runs} runs | elapsed {el / 60:.1f}m", flush=True)
@@ -1138,7 +1162,7 @@ def main():
     if board is not None:
         board.draw()
         print()                                  # drop below the board for the summary
-    cells_done = sum(1 for d in cell_done if d >= runs_per_cell)
+    cells_done = sum(1 for d in cell_done if d >= board_runs_per_cell)
 
     # ---- videos (separate phase): per (cell, gamma) best-lambda for the PRIMARY config.
     # Encodes from the trajectories the metrics phase already cached (videos/.paths/) -- no
@@ -1148,7 +1172,7 @@ def main():
         prim = {"mode": depth_modes[0], "md": min_depths[0], "pe": predict_everys[0],
                 "h": horizons[0], "cap": caps[0]}
         cells = {ci: (count, frac, args.base_seed + ci) for ci, (count, frac) in enumerate(grid)}
-        completed = {ci for ci in range(total) if cell_done[ci] >= runs_per_cell}
+        completed = {ci for ci in range(total) if cell_done[ci] >= board_runs_per_cell}
         vjobs = _build_vjobs(cells, rows_by_cell, gammas, prim, completed)
         # The video phase opens a GPU NVENC encoder per worker; consumer GPUs cap concurrent NVENC
         # sessions (too many -> a worker dies). Cap it SEPARATELY from the metrics-phase
@@ -1176,7 +1200,7 @@ def main():
         "gammas": gammas, "min_depths": min_depths, "depth_modes": depth_modes,
         "horizon": args.horizon, "horizons": horizons, "predict_every": args.predict_every,
         "predict_everys": predict_everys, "caps": caps,
-        "seconds": args.seconds, "base_seed": args.base_seed,
+        "seconds": args.seconds, "base_seed": args.base_seed, "repeats": n_repeats,
         "congestion_center_value": args.center_value, "congestion_step_value": args.step_value,
         "cells": total, "cells_completed": cells_done, "interrupted": interrupted,
         "runs": total_runs,
