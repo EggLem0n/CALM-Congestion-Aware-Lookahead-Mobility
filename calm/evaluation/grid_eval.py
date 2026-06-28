@@ -46,6 +46,7 @@ import time
 import argparse
 import threading
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime
 from itertools import zip_longest
 from multiprocessing import Array, Manager, Value
@@ -337,9 +338,55 @@ def _cell_cfg(count, frac, seed, args):
         show_planning_progress=False)
 
 
-def run_job(job, args):
-    """One planner run. Returns ONLY its CSV row (no path arrays cross the process boundary;
-    videos re-run the chosen configs deterministically afterwards)."""
+# ---------------------------------------------------------------------------
+# Saved-simulation paths: the video phase no longer re-runs PIBT. The metrics
+# phase already simulates every candidate run (baseline + the primary-config
+# gamma x lambda grid the videos pick from), so each such run dumps its agent
+# trajectory once (compact int16, zlib-compressed) into videos/.paths/. The
+# video phase then just loads them. Saving piggybacks on a sim that ran anyway
+# (~tens of ms each), so it adds <1% to the metrics phase yet removes the whole
+# (1 + #gammas) x #cells re-simulation the old video phase did.
+# ---------------------------------------------------------------------------
+def _paths_file(vdir, ci, gamma, weight, baseline):
+    """Per-run trajectory cache file under <out>/videos/.paths/."""
+    d = Path(vdir) / ".paths"
+    if baseline:
+        return d / f"ep{ci:03d}_baseline.npz"
+    return d / f"ep{ci:03d}_g{gamma:g}_w{weight:g}.npz"
+
+
+def _save_run_paths(file, paths, summary, max_t):
+    """Persist one run's full trajectory (T+1, N, 2) int16 + its task summary, atomically."""
+    file.parent.mkdir(parents=True, exist_ok=True)
+    pos = mapf.paths_to_agent_positions(paths, max_t).astype(np.int16)
+    tmp = file.with_name(file.name + ".tmp")
+    with open(tmp, "wb") as fh:            # write to a handle so numpy doesn't re-append ".npz"
+        np.savez_compressed(fh, pos=pos, summary=np.array(summary, dtype=object))
+    tmp.replace(file)
+
+
+def _pos_to_paths(pos):
+    """Rebuild MACPF's List[List[(x, y)]] paths from a saved (T+1, N, 2) array."""
+    pos = np.asarray(pos)
+    T, N = pos.shape[0], pos.shape[1]
+    return [[(int(pos[t, i, 0]), int(pos[t, i, 1])) for t in range(T)] for i in range(N)]
+
+
+def _load_run_paths(vdir, ci, *, gamma, weight, baseline):
+    """Return (paths, summary) from the trajectory cache, or None if absent/corrupt."""
+    f = _paths_file(vdir, ci, gamma, weight, baseline)
+    if not f.exists():
+        return None
+    try:
+        with np.load(f, allow_pickle=True) as d:
+            return _pos_to_paths(d["pos"]), d["summary"].item()
+    except Exception:                                   # noqa: BLE001 (corrupt/partial -> re-sim)
+        return None
+
+
+def run_job(job, args, out_dir_str=None):
+    """One planner run -> its CSV row. Candidate runs (job['save_paths']) also dump their
+    trajectory to videos/.paths/ so the video phase can encode without re-simulating."""
     if _RUNNING is not None:
         _RUNNING[os.getpid()] = _job_label(job)        # tell the board what this worker is on now
     try:
@@ -348,10 +395,17 @@ def run_job(job, args):
         cfg = _cell_cfg(job["count"], job["frac"], job["seed"], args)
         starts, _ = mapf.select_start_goal_pairs(env, walkable, cfg)
         weight = 0.0 if job["baseline"] else job["weight"]
-        _, _, m = solve(weight, env, cfg, starts, job["predict_every"],
-                        gamma=job["gamma"], horizon=job["horizon"],
-                        min_depth=job["min_depth"], depth_mode=job["depth_mode"],
-                        max_penalty=job["cap"])
+        paths, summary, m = solve(weight, env, cfg, starts, job["predict_every"],
+                                  gamma=job["gamma"], horizon=job["horizon"],
+                                  min_depth=job["min_depth"], depth_mode=job["depth_mode"],
+                                  max_penalty=job["cap"])
+        if job.get("save_paths") and out_dir_str is not None:
+            try:
+                _save_run_paths(_paths_file(Path(out_dir_str) / "videos", job["cell_idx"],
+                                            job["gamma"], weight, job["baseline"]),
+                                paths, summary, args.seconds)
+            except Exception as exc:                    # noqa: BLE001 (cache is best-effort)
+                print(f"[paths not cached] cell {job['cell_idx']}: {exc!r}", flush=True)
         if job["baseline"]:
             row = {"episode": job["cell_idx"], "num_agents": job["count"], "frac": job["frac"],
                    "gamma": "", "horizon": job["horizon"], "min_depth": "", "depth_mode": "baseline",
@@ -373,7 +427,8 @@ def video_job(vjob, args, out_dir_str):
     col 1 movement, col 2 the ACTUAL congestion field the AMRs produced, col 3 the
     SimVP-PREDICTED field (replayed post-hoc, so the vanilla run gets one too). With
     --movement-only it falls back to the plain vanilla|congestion movement clip.
-    Re-runs the baseline + each chosen config deterministically, so no paths are shipped."""
+    Loads the baseline + each chosen config's trajectory from the metrics-phase cache
+    (videos/.paths/); only if a cache file is missing does it deterministically re-sim."""
     from calm.generate_heatmap.render_heatmap import render_congestion_video
     env = get_env()
     walkable = np.asarray(env["walkable_map"]).astype(bool)
@@ -397,11 +452,16 @@ def video_job(vjob, args, out_dir_str):
     name_for = lambda g, w: (f"ep{vjob['cell_idx']:03d}_n{vjob['count']}_f{vjob['frac']:.1f}_"
                              f"{prim_mode}_md{prim_md}_g{g:g}_w{w:g}.mp4")
 
-    # vanilla (lambda 0) -- shared across every gamma in this cell
-    base_paths, base_summary, _ = solve(
-        0.0, env, cfg, starts, prim_pe,
-        gamma=next(iter(best_by_gamma)), horizon=horizon, min_depth=prim_md, depth_mode=prim_mode,
-        max_penalty=prim_cap)
+    # vanilla (lambda 0) -- shared across every gamma in this cell.
+    # Prefer the metrics-phase trajectory cache; re-sim only if it's missing.
+    loaded = _load_run_paths(vdir, vjob["cell_idx"], gamma=None, weight=0.0, baseline=True)
+    if loaded is not None:
+        base_paths, base_summary = loaded
+    else:
+        base_paths, base_summary, _ = solve(
+            0.0, env, cfg, starts, prim_pe,
+            gamma=next(iter(best_by_gamma)), horizon=horizon, min_depth=prim_md,
+            depth_mode=prim_mode, max_penalty=prim_cap)
     van_move = _animate_scenario(env, starts, clip(base_paths), base_summary,
                                  anim_cfg, tmp / "van_move.mp4", tmp / "vm")
     ap_base = mapf.paths_to_agent_positions(base_paths, vs)
@@ -414,9 +474,13 @@ def video_job(vjob, args, out_dir_str):
     runs = []
     for g in sorted(best_by_gamma):
         w = best_by_gamma[g]
-        cpaths, csumm, _ = solve(w, env, cfg, starts, prim_pe,
-                                 gamma=g, horizon=horizon, min_depth=prim_md, depth_mode=prim_mode,
-                                 max_penalty=prim_cap)
+        loaded = _load_run_paths(vdir, vjob["cell_idx"], gamma=g, weight=w, baseline=False)
+        if loaded is not None:
+            cpaths, csumm = loaded
+        else:
+            cpaths, csumm, _ = solve(w, env, cfg, starts, prim_pe,
+                                     gamma=g, horizon=horizon, min_depth=prim_md,
+                                     depth_mode=prim_mode, max_penalty=prim_cap)
         app_move = _animate_scenario(env, starts, clip(cpaths), csumm, anim_cfg,
                                      tmp / f"app_move_g{g:g}.mp4", tmp / f"am{g:g}")
         d = {"g": g, "w": w, "move": app_move}
@@ -463,6 +527,96 @@ def video_job(vjob, args, out_dir_str):
         names.append(name_for(g, w))
     shutil.rmtree(tmp, ignore_errors=True)
     return {"cell_idx": vjob["cell_idx"], "videos": names}
+
+
+def _build_vjobs(cells, rows_by_cell, gammas, prim, completed):
+    """One video job per COMPLETED cell that has at least one primary-config run.
+    `cells` maps cell_idx -> (count, frac, seed); `prim` carries the primary config
+    (mode/md/pe/h/cap). Each gamma's lambda is the one that maximised deliveries."""
+    vjobs = []
+    for ci in sorted(cells):
+        if ci not in completed:
+            continue
+        count, frac, seed = cells[ci]
+        best_by_gamma = {}
+        for g in gammas:
+            cand = [r for r in rows_by_cell.get(ci, [])
+                    if r["depth_mode"] == prim["mode"] and r["min_depth"] == prim["md"]
+                    and r["gamma"] == g and r["predict_every"] == prim["pe"]
+                    and r["horizon"] == prim["h"] and r["cap"] == prim["cap"]]
+            if cand:
+                best_by_gamma[g] = max(cand, key=lambda r: r["deliveries"])["weight"]
+        if best_by_gamma:
+            vjobs.append({"cell_idx": ci, "count": count, "frac": frac, "seed": seed,
+                          "best_by_gamma": best_by_gamma, "prim_mode": prim["mode"],
+                          "prim_md": prim["md"], "prim_pe": prim["pe"],
+                          "prim_cap": prim["cap"], "horizon": prim["h"]})
+    return vjobs
+
+
+def _render_videos(vjobs, args, out_dir_str, vworkers, on_done):
+    """Crash-isolated video rendering. A worker death (e.g. a consumer-GPU NVENC session
+    limit) only loses the cell that was on it: survivors are retried with one fewer worker,
+    and the single-worker tail puts each cell in its own pool so a hard crash can't poison
+    the rest. Per-cell soft failures are logged and skipped; finished cells keep their MP4s."""
+    if not vjobs:
+        return
+    vworkers = max(1, min(int(vworkers), len(vjobs)))
+    remaining = list(vjobs)
+    # Stage 1: multi-worker rounds. On a worker death, back off a worker and retry survivors.
+    while remaining and vworkers > 1:
+        batch, remaining = remaining, []
+        vpool = ProcessPoolExecutor(max_workers=vworkers, initializer=_init_worker)
+        broke = False
+        try:
+            fut_to_job = {vpool.submit(video_job, vj, args, out_dir_str): vj for vj in batch}
+            for fut in as_completed(fut_to_job):
+                vj = fut_to_job[fut]
+                try:
+                    on_done(fut.result())
+                except BrokenProcessPool:
+                    broke = True
+                    remaining.append(vj)               # survivor: retry next round
+                except Exception as exc:               # noqa: BLE001 (one bad cell, keep the rest)
+                    print(f"  [skip] cell {vj['cell_idx']}: video failed ({exc!r})", flush=True)
+        finally:
+            vpool.shutdown(wait=False, cancel_futures=True)
+        if broke and remaining:
+            vworkers -= 1
+            print(f"  [recover] a video worker died; retrying {len(remaining)} cell(s) "
+                  f"with {vworkers} worker(s)...", flush=True)
+    # Stage 2: one cell per fresh single-worker pool -> a hard crash is contained to that cell.
+    for vj in remaining:
+        vpool = ProcessPoolExecutor(max_workers=1, initializer=_init_worker)
+        try:
+            on_done(vpool.submit(video_job, vj, args, out_dir_str).result())
+        except Exception as exc:                       # noqa: BLE001 (incl. BrokenProcessPool)
+            print(f"  [skip] cell {vj['cell_idx']}: video failed ({exc!r})", flush=True)
+        finally:
+            vpool.shutdown(wait=False, cancel_futures=True)
+
+
+def _prune_paths(out_dir, vjobs, keep):
+    """Trim the videos/.paths/ trajectory cache after rendering.
+    keep='all' keeps every candidate (re-pick a different lambda later via --video-only),
+    'none' drops the whole cache, 'best' keeps only the baseline + best-lambda files that
+    were actually encoded (final footprint == the old 'only the best' behaviour)."""
+    pdir = Path(out_dir) / "videos" / ".paths"
+    if not pdir.exists() or keep == "all":
+        return
+    if keep == "none":
+        shutil.rmtree(pdir, ignore_errors=True)
+        return
+    vdir = Path(out_dir) / "videos"
+    keepset = set()
+    for vj in vjobs:
+        ci = vj["cell_idx"]
+        keepset.add(_paths_file(vdir, ci, None, 0.0, True).name)
+        for g, w in vj["best_by_gamma"].items():
+            keepset.add(_paths_file(vdir, ci, g, w, False).name)
+    for f in pdir.glob("*.npz"):
+        if f.name not in keepset:
+            f.unlink()
 
 
 def _init_worker(running=None):
@@ -670,6 +824,19 @@ def parse_args():
                          "induced backtracking blow-up) while still allowing dodge/wait among near-equal "
                          "cells. Omitted = a single 0 (off). Each value clamped to >= 0.")
     ap.add_argument("--no-video", action="store_true", help="metrics only, skip MP4s")
+    ap.add_argument("--keep-paths", choices=["best", "all", "none"], default="best",
+                    help="what to do with the videos/.paths/ trajectory cache after rendering. "
+                         "'best' (default): keep only the baseline + best-lambda files that were "
+                         "encoded (final footprint == the old 'only the best' behaviour). 'all': keep "
+                         "every cached candidate so --video-only can re-pick a different lambda / "
+                         "re-render later. 'none': delete the whole cache to reclaim disk.")
+    ap.add_argument("--video-only", action="store_true",
+                    help="skip the metrics phase entirely: re-render the videos for an existing run "
+                         "(--from-run) straight from its cached sim paths (no re-simulation). Safe to "
+                         "re-run if a previous render crashed; needs the run to have been produced with "
+                         "the trajectory cache (i.e. not --keep-paths none).")
+    ap.add_argument("--from-run", type=str, default=None,
+                    help="run directory (reports/CALM_comparison/<yymmdd_hhmm>) for --video-only.")
     ap.add_argument("--video-workers", type=int, default=4,
                     help="parallel workers for the VIDEO phase only (the metrics phase uses "
                          "--num_of_process). Capped separately because each video worker opens a GPU "
@@ -723,8 +890,95 @@ def parse_args():
     return args
 
 
+def _typed_metric_rows(csv_path):
+    """Read metrics.csv back with the same Python types run_job produced (so the best-lambda
+    selection in --video-only matches the inline phase). Empty cells (baseline) stay ''."""
+    def num(s, cast):
+        return cast(s) if s not in ("", None) else ""
+    rows = []
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            rows.append({
+                "episode": int(r["episode"]),
+                "num_agents": int(r["num_agents"]),
+                "frac": float(r["frac"]),
+                "gamma": num(r["gamma"], float),
+                "horizon": num(r["horizon"], int),
+                "min_depth": num(r["min_depth"], int),
+                "depth_mode": r["depth_mode"],
+                "weight": float(r["weight"]) if r["weight"] not in ("", None) else 0.0,
+                "predict_every": num(r["predict_every"], int),
+                "cap": num(r["cap"], float),
+                "deliveries": float(r["deliveries"]) if r["deliveries"] not in ("", None) else 0.0,
+            })
+    return rows
+
+
+def render_videos_only(args):
+    """Standalone video (re-)render for an existing run: read its metadata.json + metrics.csv,
+    rebuild the video jobs for the cells that fully completed, and encode straight from the
+    cached sim paths (videos/.paths/). No metrics, no re-simulation. Idempotent -- safe to
+    re-run after a crashed render."""
+    run_dir = Path(args.from_run) if args.from_run else None
+    if run_dir is None or not run_dir.is_dir():
+        raise SystemExit("--video-only requires --from-run <existing run dir>")
+    meta_path, csv_path = run_dir / "metadata.json", run_dir / "metrics.csv"
+    if not meta_path.exists() or not csv_path.exists():
+        raise SystemExit(f"missing metadata.json / metrics.csv under {run_dir}")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+
+    # Run-defining params come from metadata so cfg / any fallback re-sim is deterministic;
+    # rendering knobs (dpi, cq, grid, movement_only, ...) keep whatever this CLI invocation set.
+    args.seconds = int(meta["seconds"])
+    args.base_seed = int(meta["base_seed"])
+    args.center_value = float(meta["congestion_center_value"])
+    args.step_value = float(meta["congestion_step_value"])
+    gammas = list(meta["gammas"])
+    prim = {"mode": meta["depth_modes"][0], "md": meta["min_depths"][0],
+            "pe": meta["predict_everys"][0], "h": meta["horizons"][0], "cap": meta["caps"][0]}
+
+    rows = _typed_metric_rows(csv_path)
+    rows_by_cell = {}
+    cells = {}
+    for r in rows:
+        ci = r["episode"]
+        rows_by_cell.setdefault(ci, []).append(r)
+        cells[ci] = (r["num_agents"], r["frac"], args.base_seed + ci)
+    runs_per_cell = max(1, int(meta["runs"]) // max(1, int(meta["cells"])))
+    completed = {ci for ci, rs in rows_by_cell.items() if len(rs) >= runs_per_cell}
+
+    vjobs = _build_vjobs(cells, rows_by_cell, gammas, prim, completed)
+    if not vjobs:
+        raise SystemExit(f"no completed cells with a primary-config run to render in {run_dir}")
+    (run_dir / "videos").mkdir(parents=True, exist_ok=True)
+    vworkers = max(1, min(int(args.video_workers), len(vjobs)))
+    print(f"[video-only] {run_dir}", flush=True)
+    print(f"rendering videos for {len(vjobs)} completed cell(s) with {vworkers} worker(s) "
+          f"(vanilla | best-lambda per gamma; from cached sim paths)...", flush=True)
+    episode_videos = dict(meta.get("episode_videos", {}))
+    vdone = [0]
+
+    def absorb_v(res):
+        episode_videos[str(res["cell_idx"])] = res["videos"]
+        vdone[0] += 1
+        print(f"  [{vdone[0]:>2}/{len(vjobs)}] cell {res['cell_idx']}: {len(res['videos'])} videos",
+              flush=True)
+    try:
+        _render_videos(vjobs, args, str(run_dir), vworkers, absorb_v)
+    except KeyboardInterrupt:
+        print("\n[interrupted] video render stopped.", flush=True)
+    if args.keep_paths != "best":          # --video-only defaults to leaving the cache intact
+        _prune_paths(run_dir, vjobs, args.keep_paths)
+    meta["episode_videos"] = episode_videos
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    print(f"\nvideos -> {run_dir / 'videos'}", flush=True)
+
+
 def main():
     args = parse_args()
+    if args.video_only:
+        render_videos_only(args)
+        return
     args.horizon = max(1, min(10, int(args.horizon)))
     if args.predict_every is None:
         args.predict_every = max(1, 11 - args.horizon)   # full-depth lookahead (handoff section 4)
@@ -782,13 +1036,18 @@ def main():
     # the very tail. Jobs are interleaved across cells (round-robin) so every cell has work in
     # the first wave. The board keeps its current form (one mark per (count, frac) cell); a
     # cell flips to done once all of its own runs complete.
+    # A run's trajectory is cached (for the video phase) iff it is a video candidate:
+    # the baseline, or a PRIMARY-config congestion run (the gamma x lambda grid the videos
+    # pick the best lambda from). Off when videos are disabled.
+    videos_on = (not args.no_video) and bool(weights_pos)
+    prim0 = (depth_modes[0], min_depths[0], predict_everys[0], horizons[0], caps[0])
     per_cell_jobs = []
     for ci, (count, frac) in enumerate(grid):
         seed = args.base_seed + ci               # per-cell seed, shared by that cell's runs (A/B)
         jl = [{"cell_idx": ci, "count": count, "frac": frac, "seed": seed, "baseline": True,
                "weight": 0.0, "gamma": gammas[0], "horizon": horizons[0],
                "min_depth": min_depths[0], "depth_mode": depth_modes[0],
-               "predict_every": predict_everys[0], "cap": caps[0]}]
+               "predict_every": predict_everys[0], "cap": caps[0], "save_paths": videos_on}]
         for mode in depth_modes:
             for md in min_depths:
                 for g in gammas:
@@ -796,10 +1055,12 @@ def main():
                         for w in weights_pos:
                             for pe in predict_everys:
                                 for cap in caps:
+                                    is_prim = (mode, md, pe, h, cap) == prim0
                                     jl.append({"cell_idx": ci, "count": count, "frac": frac,
                                                "seed": seed, "baseline": False, "weight": w,
                                                "gamma": g, "horizon": h, "min_depth": md,
-                                               "depth_mode": mode, "predict_every": pe, "cap": cap})
+                                               "depth_mode": mode, "predict_every": pe, "cap": cap,
+                                               "save_paths": videos_on and is_prim})
         per_cell_jobs.append(jl)
     jobs = [j for wave in zip_longest(*per_cell_jobs) for j in wave if j is not None]
     total_runs = len(jobs)
@@ -854,7 +1115,7 @@ def main():
     if workers == 1:
         try:
             for job in jobs:
-                absorb(run_job(job, args))
+                absorb(run_job(job, args, str(out_dir)))
         except KeyboardInterrupt:
             interrupted = True
             print("\n[interrupted] stopped; partial metrics.csv is kept.", flush=True)
@@ -862,7 +1123,7 @@ def main():
         # Explicit pool (not `with`): on Ctrl+C, terminate workers immediately.
         pool = ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(running,))
         try:
-            futs = [pool.submit(run_job, job, args) for job in jobs]
+            futs = [pool.submit(run_job, job, args, str(out_dir)) for job in jobs]
             for fut in as_completed(futs):
                 absorb(fut.result())
             pool.shutdown()
@@ -880,32 +1141,21 @@ def main():
     cells_done = sum(1 for d in cell_done if d >= runs_per_cell)
 
     # ---- videos (separate phase): per (cell, gamma) best-lambda for the PRIMARY config.
-    # Re-runs the chosen configs deterministically (same seed) instead of shipping path arrays;
-    # rendered in parallel across cells.
-    if not args.no_video and weights_pos and not interrupted:
-        prim_mode, prim_md = depth_modes[0], min_depths[0]
-        prim_pe, prim_h, prim_cap = predict_everys[0], horizons[0], caps[0]
-        vjobs = []
-        for ci, (count, frac) in enumerate(grid):
-            best_by_gamma = {}
-            for g in gammas:
-                cand = [r for r in rows_by_cell[ci] if r["depth_mode"] == prim_mode
-                        and r["min_depth"] == prim_md and r["gamma"] == g
-                        and r["predict_every"] == prim_pe and r["horizon"] == prim_h
-                        and r["cap"] == prim_cap]
-                if cand:
-                    best_by_gamma[g] = max(cand, key=lambda r: r["deliveries"])["weight"]
-            if best_by_gamma:
-                vjobs.append({"cell_idx": ci, "count": count, "frac": frac,
-                              "seed": args.base_seed + ci, "best_by_gamma": best_by_gamma,
-                              "prim_mode": prim_mode, "prim_md": prim_md, "prim_pe": prim_pe,
-                              "prim_cap": prim_cap, "horizon": prim_h})
+    # Encodes from the trajectories the metrics phase already cached (videos/.paths/) -- no
+    # re-simulation. Only FULLY-completed cells are rendered, so an interrupted sweep still
+    # gets videos for the cells that finished. Crash-isolated across cells.
+    if not args.no_video and weights_pos:
+        prim = {"mode": depth_modes[0], "md": min_depths[0], "pe": predict_everys[0],
+                "h": horizons[0], "cap": caps[0]}
+        cells = {ci: (count, frac, args.base_seed + ci) for ci, (count, frac) in enumerate(grid)}
+        completed = {ci for ci in range(total) if cell_done[ci] >= runs_per_cell}
+        vjobs = _build_vjobs(cells, rows_by_cell, gammas, prim, completed)
         # The video phase opens a GPU NVENC encoder per worker; consumer GPUs cap concurrent NVENC
-        # sessions (too many -> the whole phase dies). Cap it SEPARATELY from the metrics-phase
+        # sessions (too many -> a worker dies). Cap it SEPARATELY from the metrics-phase
         # --num_of_process (which only does inference, no NVENC). Never exceed the number of videos.
-        vworkers = max(1, min(int(args.video_workers), len(vjobs)))
-        print(f"\nrendering videos for {len(vjobs)} cells with {vworkers} worker(s) "
-              f"(vanilla | best-lambda per gamma; configs re-run deterministically)...", flush=True)
+        vworkers = max(1, min(int(args.video_workers), len(vjobs))) if vjobs else 0
+        print(f"\nrendering videos for {len(vjobs)} completed cell(s) with {vworkers} worker(s) "
+              f"(vanilla | best-lambda per gamma; from cached sim paths)...", flush=True)
         vdone = [0]
 
         def absorb_v(res):
@@ -914,19 +1164,10 @@ def main():
             print(f"  [{vdone[0]:>2}/{len(vjobs)}] cell {res['cell_idx']}: {len(res['videos'])} videos",
                   flush=True)
         try:
-            if vworkers == 1:
-                for vj in vjobs:
-                    absorb_v(video_job(vj, args, str(out_dir)))
-            else:
-                vpool = ProcessPoolExecutor(max_workers=vworkers, initializer=_init_worker)
-                vfuts = [vpool.submit(video_job, vj, args, str(out_dir)) for vj in vjobs]
-                for fut in as_completed(vfuts):
-                    absorb_v(fut.result())
-                vpool.shutdown()
+            _render_videos(vjobs, args, str(out_dir), vworkers, absorb_v)
         except KeyboardInterrupt:
             print("\n[interrupted] video phase stopped (metrics already saved).", flush=True)
-        except Exception as exc:  # noqa: BLE001  (videos are optional; never lose the metrics)
-            print(f"[videos skipped] {exc!r}", flush=True)
+        _prune_paths(out_dir, vjobs, args.keep_paths)
 
     # ---- metadata.json ----
     (out_dir / "metadata.json").write_text(json.dumps({
