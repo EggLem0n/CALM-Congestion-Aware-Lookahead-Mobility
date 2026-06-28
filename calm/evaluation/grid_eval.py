@@ -670,6 +670,13 @@ def parse_args():
                          "induced backtracking blow-up) while still allowing dodge/wait among near-equal "
                          "cells. Omitted = a single 0 (off). Each value clamped to >= 0.")
     ap.add_argument("--no-video", action="store_true", help="metrics only, skip MP4s")
+    ap.add_argument("--video-workers", type=int, default=4,
+                    help="parallel workers for the VIDEO phase only (the metrics phase uses "
+                         "--num_of_process). Capped separately because each video worker opens a GPU "
+                         "NVENC encoder session, and consumer GPUs allow only a few concurrent sessions "
+                         "(too many -> 'OpenEncodeSessionEx failed / No capable devices found' and the "
+                         "whole video phase dies). Default 4 is safe; raise it if your GPU/driver handled "
+                         "more (composite mode also loads the 220MB predictor per worker, so watch VRAM).")
     # --- MACPF animate_paths knobs (videos) ---
     ap.add_argument("--anim-subframes", type=int, default=1,
                     help="interpolated frames per sim-step at 30fps. 30=realtime/smooth but ~30x "
@@ -893,8 +900,12 @@ def main():
                               "seed": args.base_seed + ci, "best_by_gamma": best_by_gamma,
                               "prim_mode": prim_mode, "prim_md": prim_md, "prim_pe": prim_pe,
                               "prim_cap": prim_cap, "horizon": prim_h})
-        print(f"\nrendering videos for {len(vjobs)} cells (vanilla | best-lambda per gamma; "
-              f"configs re-run deterministically)...", flush=True)
+        # The video phase opens a GPU NVENC encoder per worker; consumer GPUs cap concurrent NVENC
+        # sessions (too many -> the whole phase dies). Cap it SEPARATELY from the metrics-phase
+        # --num_of_process (which only does inference, no NVENC). Never exceed the number of videos.
+        vworkers = max(1, min(int(args.video_workers), len(vjobs)))
+        print(f"\nrendering videos for {len(vjobs)} cells with {vworkers} worker(s) "
+              f"(vanilla | best-lambda per gamma; configs re-run deterministically)...", flush=True)
         vdone = [0]
 
         def absorb_v(res):
@@ -903,11 +914,11 @@ def main():
             print(f"  [{vdone[0]:>2}/{len(vjobs)}] cell {res['cell_idx']}: {len(res['videos'])} videos",
                   flush=True)
         try:
-            if workers == 1:
+            if vworkers == 1:
                 for vj in vjobs:
                     absorb_v(video_job(vj, args, str(out_dir)))
             else:
-                vpool = ProcessPoolExecutor(max_workers=workers, initializer=_init_worker)
+                vpool = ProcessPoolExecutor(max_workers=vworkers, initializer=_init_worker)
                 vfuts = [vpool.submit(video_job, vj, args, str(out_dir)) for vj in vjobs]
                 for fut in as_completed(vfuts):
                     absorb_v(fut.result())
