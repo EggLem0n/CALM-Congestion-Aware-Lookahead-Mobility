@@ -96,6 +96,7 @@ def plan_pibt_repeated_tasks(
     congestion_horizon: int = 10,           # H: max descent depth read (<= 10 forecast frames)
     congestion_min_depth: int = 2,          # k_start: skip k=1 (the candidate cell itself)
     congestion_depth_mode: str = "peaked",  # "peaked" (k*r^(k-1)) or "frontload" (r^(k-1))
+    congestion_max_penalty: float = 0.0,    # clip lambda*cong to this many distance-cells (0 = off)
     predict_every: int = 10,
 ) -> Tuple[List[PathType], Dict[str, Any]]:
     """Lifelong PIBT. With ``congestion_predictor`` set and ``congestion_weight > 0``
@@ -111,7 +112,13 @@ def plan_pibt_repeated_tasks(
     through a forecast jam. The predictor is duck-typed (``.predict((10,1,H,W)) ->
     (10,1,H,W)`` raw congestion) so this numpy-only module never imports torch. With no
     predictor / weight 0 the behaviour is byte-for-byte the original PIBT, which is
-    exactly the A/B baseline."""
+    exactly the A/B baseline.
+
+    ``congestion_max_penalty`` optionally clips each candidate's ``congestion_weight *
+    cong`` to that many distance-cells (0 = off, the default / unbounded behaviour). A
+    cap <= 1 keeps the distance-minimizing move ranked first, preserving PIBT's progress
+    guarantee so the congestion term can never trigger a priority-inheritance backtracking
+    blow-up; it still reorders among near-equal-distance candidates (dodge / wait)."""
     rng = np.random.default_rng(config.seed + 1000)
     walkable = np.asarray(walkable_map).astype(bool)
     H, W = walkable.shape[:2]
@@ -126,6 +133,7 @@ def plan_pibt_repeated_tasks(
     predict_every = max(1, min(10, int(predict_every)))
     congestion_horizon = max(1, min(10, int(congestion_horizon)))
     congestion_min_depth = max(1, int(congestion_min_depth))
+    congestion_max_penalty = max(0.0, float(congestion_max_penalty))
     weight_fn = (_depth_weight_frontload
                  if str(congestion_depth_mode) == "frontload" else _depth_weight)
     path_cache: Dict[Tuple[Coord, Coord], List[Tuple[int, Coord]]] = {}
@@ -246,7 +254,15 @@ def plan_pibt_repeated_tasks(
                     # ahead; the penalty must only discriminate AMONG options, never
                     # penalize forward progress itself.)
                     cong = congestion_cost(c, g, pred, offset)
-                    return (base + congestion_weight * cong, rng.random())
+                    pen = congestion_weight * cong
+                    # Optional clip: bound how far the congestion term can reorder candidates
+                    # against distance-to-goal. With a cap <= 1 the distance-minimizing move
+                    # always ranks first, so PIBT keeps making progress and the congestion term
+                    # can never trigger the priority-inheritance backtracking blow-up that a
+                    # mis-aligned forecast would otherwise cause. 0 = off (unbounded; the A/B default).
+                    if congestion_max_penalty > 0.0:
+                        pen = min(pen, congestion_max_penalty)
+                    return (base + pen, rng.random())
                 cands.sort(key=key_fn)
             for v in cands:
                 if v in occupied_next:
@@ -345,6 +361,7 @@ def plan_pibt_repeated_tasks(
         "congestion_horizon": int(congestion_horizon),
         "congestion_min_depth": int(congestion_min_depth),
         "congestion_depth_mode": str(congestion_depth_mode),
+        "congestion_max_penalty": float(congestion_max_penalty),
         "congestion_prediction_count": int(prediction_count),
     }
     return paths, summary
