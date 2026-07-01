@@ -140,12 +140,13 @@ def main() -> None:
     write_csv(csv_path, m, args.y_scale)
 
     # console table
-    print("  horizon |   MSE(norm)   MAE(norm)  |   MSE(raw)     MAE(raw)")
-    print("  --------+--------------------------+------------------------")
+    print("  horizon |   MSE(norm)   MAE(norm)  RMSE(norm) |    MSE(raw)    MAE(raw)  RMSE(raw)")
+    print("  --------+-----------------------------------+-------------------------------------")
     s2 = args.y_scale ** 2
     for t in range(len(m["mse"])):
-        print(f"   t+{t + 1:<2}   | {m['mse'][t]:.4e}  {m['mae'][t]:.4e} | "
-              f"{m['mse'][t] * s2:11.2f}  {m['mae'][t] * args.y_scale:9.3f}")
+        print(f"   t+{t + 1:<2}   | {m['mse'][t]:.4e}  {m['mae'][t]:.4e}  {m['rmse'][t]:.4e} | "
+              f"{m['mse'][t] * s2:11.2f}  {m['mae'][t] * args.y_scale:9.3f}  "
+              f"{m['rmse'][t] * args.y_scale:9.3f}")
     print(f"[per_frame_accuracy] wrote {csv_path}")
 
     if not args.no_plot:
